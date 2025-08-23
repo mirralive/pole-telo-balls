@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import logging
+import asyncio
 from contextlib import closing
 
 from aiogram import Bot, Dispatcher, executor, types
@@ -13,7 +14,12 @@ if not TOKEN:
     raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN environment variable with your bot token.")
 
 DB_PATH = os.getenv("DB_PATH", "scores.db")
-HASHTAG_PATTERN = re.compile(r"(?i)(#\\s*\\+\\s*1|#балл(ы)?|#очки|#score|#point|#points)\\b")
+
+# Обычные хэштеги для +1
+HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
+
+# Спец-ключ для челленджа (+5)
+CHALLENGE_TAG = "#челлендж1"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
@@ -36,7 +42,10 @@ def init_db():
         """)
         conn.commit()
 
-def add_point(chat_id: int, user: types.User) -> int:
+def add_point(chat_id: int, user: types.User, amount: int = 1) -> int:
+    """Прибавляет amount баллов пользователю и возвращает его новый баланс."""
+    if amount == 0:
+        return get_points(chat_id, user.id)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         with closing(conn.cursor()) as cur:
@@ -46,9 +55,9 @@ def add_point(chat_id: int, user: types.User) -> int:
                 ON CONFLICT(chat_id, user_id) DO NOTHING
             """, (chat_id, user.id, user.username or "", f"{user.full_name}"))
             cur.execute("""
-                UPDATE scores SET points = points + 1, username = ?, full_name = ?
+                UPDATE scores SET points = points + ?, username = ?, full_name = ?
                 WHERE chat_id = ? AND user_id = ?
-            """, (user.username or "", f"{user.full_name}", chat_id, user.id))
+            """, (amount, user.username or "", f"{user.full_name}", chat_id, user.id))
             conn.commit()
             cur.execute("SELECT points FROM scores WHERE chat_id = ? AND user_id = ?", (chat_id, user.id))
             row = cur.fetchone()
@@ -74,13 +83,15 @@ def get_top(chat_id: int, limit: int = 10):
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
-        "Привет! Я считаю баллы по хэштегам в комментариях.\n\n"
-        "Пиши в комментариях к постам канала/в группе: <b>#балл</b> или <b>#+1</b>, и я добавлю балл.\n\n"
+        "Привет! Я считаю баллы по хэштегам в комментариях (группе обсуждений).\n\n"
+        "Как набрать очки:\n"
+        "• Напиши: <b>#челлендж1</b> — получишь <b>+5</b> баллов.\n"
+        "• Напиши: <b>#балл</b> или <b>#+1</b> — получишь <b>+1</b> балл.\n\n"
         "Команды:\n"
-        "• /моибаллы — показать твои баллы\n"
-        "• /top — топ-10 чата\n"
-        "• /help — справка\n\n"
-        "<i>Важно: меня надо добавить в привязанную к каналу группу-комментарии и отключить Privacy в @BotFather.</i>"
+        "• /баланс — показать твой баланс\n"
+        "• /моибаллы — то же самое\n"
+        "• /top — топ-10 по чату\n\n"
+        "<i>Важно: добавь меня в привязанную к каналу группу-комментарии и отключи Privacy в @BotFather.</i>"
     )
     await message.reply(text)
 
@@ -89,23 +100,26 @@ async def cmd_my(message: types.Message):
     pts = get_points(message.chat.id, message.from_user.id)
     await message.reply(f"Твои баллы: <b>{pts}</b>")
 
+@dp.message_handler(commands=["баланс"])
+async def cmd_balance(message: types.Message):
+    pts = get_points(message.chat.id, message.from_user.id)
+    await message.reply(f"Ваш баланс: <b>{pts}</b>")
+
 @dp.message_handler(commands=["top", "топ"])
 async def cmd_top(message: types.Message):
     rows = get_top(message.chat.id, limit=10)
     if not rows:
-        await message.reply("Пока пусто. Напиши #балл в этом чате, чтобы начать.")
+        await message.reply("Пока пусто. Напиши #балл или #челлендж1 в этом чате, чтобы начать.")
         return
     lines = ["🏆 <b>Топ этого чата</b>"]
-    place = 1
-    for user_id, pts, username, full_name in rows:
+    for i, (user_id, pts, username, full_name) in enumerate(rows, start=1):
         name = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{full_name}</a>'
-        lines.append(f"{place}. {name} — <b>{pts}</b>")
-        place += 1
+        lines.append(f"{i}. {name} — <b>{pts}</b>")
     await message.reply("\n".join(lines), disable_web_page_preview=True)
 
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
-    # Only count in groups/supergroups (i.e., comment groups)
+    # Считаем только в группах/супергруппах (комментарии)
     if message.chat.type not in ("group", "supergroup"):
         return
     if not message.text:
@@ -113,11 +127,28 @@ async def handle_text(message: types.Message):
     if message.from_user and message.from_user.is_bot:
         return
 
-    text = message.text.strip()
-    if HASHTAG_PATTERN.search(text):
-        new_points = add_point(message.chat.id, message.from_user)
-        name = message.from_user.first_name or "Игрок"
-        await message.reply(f"✅ Балл засчитан, {name}! Теперь у тебя <b>{new_points}</b>.")
+    text_lc = message.text.strip().lower()
+
+    # 1) Спец-правило: #челлендж1 = +5
+    if CHALLENGE_TAG in text_lc:
+        new_points = add_point(message.chat.id, message.from_user, amount=5)
+        sent = await message.reply(
+            f"✅ Вам засчитано <b>+5</b> баллов! Ваш баланс: <b>{new_points}</b>"
+        )
+        # авто-удаление ответа бота через 5 секунд
+        async def _autodelete():
+            await asyncio.sleep(5)
+            try:
+                await bot.delete_message(sent.chat.id, sent.message_id)
+            except Exception:
+                pass
+        asyncio.create_task(_autodelete())
+        return
+
+    # 2) Обычные хэштеги (+1)
+    if HASHTAG_PATTERN.search(text_lc):
+        new_points = add_point(message.chat.id, message.from_user, amount=1)
+        await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
 def main():
     init_db()

@@ -27,7 +27,7 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
 # Хэштеги
 HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
-CHALLENGE_TAG = "#челлендж1"
+CHALLENGE_TAG = "#челлендж1"  # эталон, с которым сравниваем после нормализации
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
@@ -120,7 +120,41 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
         conn.commit()
         return True
 
-# --- Utils: авто-удаление и удаление команд ---
+# --- Utils ---
+def normalize_tag(tag: str) -> str:
+    """
+    Приводим хэштег к униформе: нижний регистр, убираем пробелы после #, обрезаем вокруг.
+    Пример: '# Челлендж1 ' -> '#челлендж1'
+    """
+    if not tag:
+        return tag
+    t = tag.strip().lower()
+    if t.startswith("#"):
+        # убираем любые пробелы сразу после '#'
+        t = "#" + t[1:].lstrip()
+    return t
+
+def extract_hashtags(message: types.Message):
+    """
+    Достаём хэштеги из:
+    - message.text + message.entities
+    - message.caption + message.caption_entities (для фото/видео с подписью)
+    Возвращаем список НОРМАЛИЗОВАННЫХ тегов (normalize_tag).
+    """
+    tags = []
+
+    def collect(text, entities):
+        if not text or not entities:
+            return
+        for ent in entities:
+            if ent.type == "hashtag":
+                tag = text[ent.offset: ent.offset + ent.length]
+                tags.append(normalize_tag(tag))
+
+    collect(message.text, message.entities)
+    collect(getattr(message, "caption", None), getattr(message, "caption_entities", None))
+    return tags
+
 async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     """Ответить и удалить ОТВЕТ бота через delay секунд."""
     sent = await message.reply(text)
@@ -183,27 +217,26 @@ async def cmd_all(message: types.Message):
     await reply_autodel(message, f"🌍 Общий счёт всех участников: <b>{total}</b> баллов")
     await delete_user_command_if_group(message)
 
-# --- Text handler (хэштеги) ---
-@dp.message_handler(content_types=types.ContentType.TEXT)
-async def handle_text(message: types.Message):
+# --- Hashtags handler (любой контент с текстом/подписью) ---
+@dp.message_handler(content_types=types.ContentType.ANY)
+async def handle_any(message: types.Message):
+    # работаем только в группах/супергруппах
     if message.chat.type not in ("group", "supergroup"):
         return
-    if not message.text or (message.from_user and message.from_user.is_bot):
+    if (message.from_user and message.from_user.is_bot):
         return
 
-    text_lc = message.text.strip().lower()
+    # берём и text, и caption
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return
 
-    # соберём хэштеги из entities
-    hashtags = []
-    if message.entities:
-        for ent in message.entities:
-            if ent.type == "hashtag":
-                tag = message.text[ent.offset: ent.offset + ent.length].lower()
-                hashtags.append(tag)
-    print(f"DEBUG hashtags: {hashtags}, text: {text_lc}")  # отладка!
+    text_lc = text.lower()
+    tags = extract_hashtags(message)
 
     # --- спец-хэштег +5 ---
-    if any("челлендж1" in t for t in hashtags) or "челлендж1" in text_lc:
+    # триггер, если есть нормализованный тег ровно '#челлендж1'
+    if CHALLENGE_TAG in tags or "#челлендж1" in text_lc:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
@@ -215,13 +248,22 @@ async def handle_text(message: types.Message):
         return
 
     # --- обычные +1 ---
-    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in hashtags) \
-       or HASHTAG_PATTERN.search(text_lc):
+    plus_one = False
+    # если в entities/caption_entities есть один из стандартных тегов
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags):
+        plus_one = True
+    # или по текстовой регулярке (поддержка шортформы #+1 и пробелов)
+    elif HASHTAG_PATTERN.search(text_lc):
+        plus_one = True
+
+    if plus_one:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=1)
+        # подтверждение +1 оставляем висеть (как ты просила)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
+
 # --- Startup ---
 async def startup_common():
     me = await bot.get_me()

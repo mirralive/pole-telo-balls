@@ -186,7 +186,6 @@ async def cmd_all(message: types.Message):
 # --- Text handler (хэштеги) ---
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
-    # работаем только в группах/супергруппах
     if message.chat.type not in ("group", "supergroup"):
         return
     if not message.text or (message.from_user and message.from_user.is_bot):
@@ -194,16 +193,17 @@ async def handle_text(message: types.Message):
 
     text_lc = message.text.strip().lower()
 
-    # соберём хэштеги из entities (надёжнее) + оставим резерв по тексту
+    # соберём хэштеги из entities
     hashtags = []
     if message.entities:
         for ent in message.entities:
             if ent.type == "hashtag":
                 tag = message.text[ent.offset: ent.offset + ent.length].lower()
                 hashtags.append(tag)
+    print(f"DEBUG hashtags: {hashtags}, text: {text_lc}")  # отладка!
 
     # --- спец-хэштег +5 ---
-    if CHALLENGE_TAG in hashtags or CHALLENGE_TAG in text_lc:
+    if any("челлендж1" in t for t in hashtags) or "челлендж1" in text_lc:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
@@ -215,20 +215,13 @@ async def handle_text(message: types.Message):
         return
 
     # --- обычные +1 ---
-    plus_one = False
-    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in hashtags):
-        plus_one = True
-    elif HASHTAG_PATTERN.search(text_lc):
-        plus_one = True
-
-    if plus_one:
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in hashtags) \
+       or HASHTAG_PATTERN.search(text_lc):
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=1)
-        # подтверждение +1 оставляем висеть (как просила)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
-
 # --- Startup ---
 async def startup_common():
     me = await bot.get_me()

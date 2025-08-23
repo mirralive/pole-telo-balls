@@ -5,21 +5,26 @@ import sqlite3
 import logging
 import asyncio
 from contextlib import closing
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.exceptions import ConflictError
 
-# --- Configuration ---
+# --- Config ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
 if not TOKEN:
-    raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN environment variable with your bot token.")
+    raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN).")
 
 DB_PATH = os.getenv("DB_PATH", "scores.db")
 
-# Обычные хэштеги для +1
-HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
+# Webhook config (optional). If WEBHOOK_URL is set -> webhook mode
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
 
-# Спец-ключ для челленджа (+5)
+# Normal +1 hashtags
+HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
+# Challenge +5
 CHALLENGE_TAG = "#челлендж1"
 
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +33,7 @@ logger = logging.getLogger("points-bot")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-# --- Database helpers ---
+# --- DB helpers ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -44,7 +49,6 @@ def init_db():
         conn.commit()
 
 def add_point(chat_id: int, user: types.User, amount: int = 1) -> int:
-    """Прибавляет amount баллов пользователю и возвращает его новый баланс."""
     if amount == 0:
         return get_points(chat_id, user.id)
     with sqlite3.connect(DB_PATH) as conn:
@@ -80,28 +84,21 @@ def get_top(chat_id: int, limit: int = 10):
         """, (chat_id, limit))
         return cur.fetchall()
 
-# --- Help/commands ---
+# --- Commands ---
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
-        "Привет! Я считаю баллы по хэштегам в комментариях (группе обсуждений).\n\n"
+        "Привет! Я считаю баллы по хэштегам в комментариях (группа обсуждений).\n\n"
         "Как набрать очки:\n"
-        "• Напиши: <b>#челлендж1</b> — получишь <b>+5</b> баллов.\n"
-        "• Напиши: <b>#балл</b> или <b>#+1</b> — получишь <b>+1</b> балл.\n\n"
+        "• <b>#челлендж1</b> — <b>+5</b> баллов.\n"
+        "• <b>#балл</b> или <b>#+1</b> — <b>+1</b> балл.\n\n"
         "Команды:\n"
-        "• /баланс — показать твой баланс\n"
-        "• /моибаллы — то же самое\n"
-        "• /top — топ-10 по чату\n\n"
-        "<i>Важно: добавь меня в привязанную к каналу группу-комментарии и отключи Privacy в @BotFather.</i>"
+        "• /баланс или /моибаллы — твой баланс\n"
+        "• /top — топ-10 по чату\n"
     )
     await message.reply(text)
 
-@dp.message_handler(commands=["моибаллы", "my", "me", "moi", "moibal"])
-async def cmd_my(message: types.Message):
-    pts = get_points(message.chat.id, message.from_user.id)
-    await message.reply(f"Твои баллы: <b>{pts}</b>")
-
-@dp.message_handler(commands=["баланс"])
+@dp.message_handler(commands=["моибаллы", "my", "me", "moi", "moibal", "баланс"])
 async def cmd_balance(message: types.Message):
     pts = get_points(message.chat.id, message.from_user.id)
     await message.reply(f"Ваш баланс: <b>{pts}</b>")
@@ -110,7 +107,7 @@ async def cmd_balance(message: types.Message):
 async def cmd_top(message: types.Message):
     rows = get_top(message.chat.id, limit=10)
     if not rows:
-        await message.reply("Пока пусто. Напиши #балл или #челлендж1 в этом чате, чтобы начать.")
+        await message.reply("Пока пусто. Напишите #балл или #челлендж1 в этом чате, чтобы начать.")
         return
     lines = ["🏆 <b>Топ этого чата</b>"]
     for i, (user_id, pts, username, full_name) in enumerate(rows, start=1):
@@ -121,23 +118,15 @@ async def cmd_top(message: types.Message):
 # --- Messages / scoring ---
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
-    # Считаем только в группах/супергруппах (комментарии)
     if message.chat.type not in ("group", "supergroup"):
         return
-    if not message.text:
+    if not message.text or (message.from_user and message.from_user.is_bot):
         return
-    if message.from_user and message.from_user.is_bot:
-        return
-
     text_lc = message.text.strip().lower()
 
-    # 1) Спец-правило: #челлендж1 = +5
-    if CHALLENGE_TAG in text_lc:
+    if "#челлендж1" in text_lc:
         new_points = add_point(message.chat.id, message.from_user, amount=5)
-        sent = await message.reply(
-            f"✅ Вам засчитано <b>+5</b> баллов! Ваш баланс: <b>{new_points}</b>"
-        )
-        # авто-удаление ответа бота через 5 секунд
+        sent = await message.reply(f"✅ Вам засчитано <b>+5</b> баллов! Ваш баланс: <b>{new_points}</b>")
         async def _autodelete():
             await asyncio.sleep(5)
             try:
@@ -147,39 +136,49 @@ async def handle_text(message: types.Message):
         asyncio.create_task(_autodelete())
         return
 
-    # 2) Обычные хэштеги (+1)
     if HASHTAG_PATTERN.search(text_lc):
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
-# --- Startup hook: drop webhook to avoid conflicts with polling ---
-async def on_startup(dp: Dispatcher):
-    try:
-        # снимаем webhook и сбрасываем «висящие» апдейты
+# --- Startup hooks ---
+async def startup_common():
+    # Проверим токен и снимем/поставим вебхук по режиму
+    me = await bot.get_me()
+    logger.info(f"Authorized as @{me.username} (id={me.id})")
+    if WEBHOOK_URL:
+        # Webhook mode
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted (if any). Switching to polling.")
-    except Exception as e:
-        logger.warning(f"Couldn't delete webhook: {e}")
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True, allowed_updates=["message"])
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
+    else:
+        # Polling mode
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted. Using polling.")
 
 def main():
     init_db()
-    logger.info("Starting bot polling...")
-
-    async def startup_checks():
+    if WEBHOOK_URL:
+        # --- Webhook mode ---
+        parsed = urlparse(WEBHOOK_URL)
+        webhook_path = parsed.path or "/webhook"
+        logger.info(f"Starting webhook server on {HOST}:{PORT}, path={webhook_path}")
+        executor.start_webhook(
+            dispatcher=dp,
+            webhook_path=webhook_path,
+            on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()),
+            skip_updates=True,
+            host=HOST,
+            port=PORT,
+        )
+    else:
+        # --- Polling mode ---
+        logger.info("Starting bot polling...")
         try:
-            me = await bot.get_me()
-            logger.info(f"Bot authorized as @{me.username} (id={me.id})")
-            # Снимем вебхук на всякий случай
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            logger.error(f"Startup auth/webhook check failed: {e}")
-            # При невалидном токене aiogram выдаст Unauthorized — завершимся,
-            # чтобы в логах было понятно, а не бесконечные попытки.
+            executor.start_polling(dp, skip_updates=True, on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()))
+        except ConflictError as e:
+            logger.error(f"Polling conflict: {e}")
+            # Если всё же конфликт — предложим явный переход на webhook
             raise
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(startup_checks())
-    executor.start_polling(dp, skip_updates=True)
 
 if __name__ == "__main__":
     main()

@@ -7,6 +7,7 @@ import asyncio
 from contextlib import closing
 
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.utils.exceptions import ConflictError
 
 # --- Configuration ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
@@ -79,7 +80,7 @@ def get_top(chat_id: int, limit: int = 10):
         """, (chat_id, limit))
         return cur.fetchall()
 
-# --- Handlers ---
+# --- Help/commands ---
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
@@ -117,6 +118,7 @@ async def cmd_top(message: types.Message):
         lines.append(f"{i}. {name} — <b>{pts}</b>")
     await message.reply("\n".join(lines), disable_web_page_preview=True)
 
+# --- Messages / scoring ---
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
     # Считаем только в группах/супергруппах (комментарии)
@@ -150,10 +152,29 @@ async def handle_text(message: types.Message):
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
+# --- Startup hook: drop webhook to avoid conflicts with polling ---
+async def on_startup(dp: Dispatcher):
+    try:
+        # снимаем webhook и сбрасываем «висящие» апдейты
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted (if any). Switching to polling.")
+    except Exception as e:
+        logger.warning(f"Couldn't delete webhook: {e}")
+
 def main():
     init_db()
     logger.info("Starting bot polling...")
-    executor.start_polling(dp, skip_updates=True)
+    try:
+        executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    except ConflictError as e:
+        # На всякий случай ловим конфликт и пробуем ещё раз после сброса вебхука
+        logger.error(f"Polling conflict: {e}")
+        # второй запуск после задержки
+        async def restart():
+            await asyncio.sleep(2)
+            await on_startup(dp)
+            executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+        asyncio.get_event_loop().run_until_complete(restart())
 
 if __name__ == "__main__":
     main()

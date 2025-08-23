@@ -177,7 +177,9 @@ async def handle_text(message: types.Message):
     if plus_one:
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
-
+if "челлендж1" in text_lc:
+    await message.reply("DEBUG: поймал челлендж1")
+    return
 # --- Startup ---
 async def startup_common():
     me = await bot.get_me()
@@ -212,3 +214,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    @dp.message_handler(content_types=types.ContentType.ANY)
+async def debug_all(message: types.Message):
+    print(f"DEBUG: chat={message.chat.id}, from={message.from_user.id}, text={message.text}, entities={message.entities}")

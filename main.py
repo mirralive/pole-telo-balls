@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 import os
 import re
 import sqlite3
@@ -8,7 +8,6 @@ from contextlib import closing
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.utils.exceptions import ConflictError
 
 # --- Config ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
@@ -20,11 +19,11 @@ DB_PATH = os.getenv("DB_PATH", "scores.db")
 # Webhook config (optional). If WEBHOOK_URL is set -> webhook mode
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
+PORT = int(os.getenv("PORT", "10000"))
 
-# Normal +1 hashtags
+# Хэштеги +1
 HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
-# Challenge +5
+# Спец-хэштег +5
 CHALLENGE_TAG = "#челлендж1"
 
 logging.basicConfig(level=logging.INFO)
@@ -84,84 +83,103 @@ def get_top(chat_id: int, limit: int = 10):
         """, (chat_id, limit))
         return cur.fetchall()
 
-# --- Commands ---
+# --- Utils: auto-delete replies & delete user command in groups ---
+async def reply_autodel(message: types.Message, text: str, delay: int = 5):
+    """Reply and auto-delete bot reply after delay seconds."""
+    sent = await message.reply(text)
+    async def _autodelete():
+        await asyncio.sleep(delay)
+        try:
+            await bot.delete_message(sent.chat.id, sent.message_id)
+        except Exception:
+            pass
+    asyncio.create_task(_autodelete())
+
+async def delete_user_command_if_group(message: types.Message):
+    """Delete user's command message only in group/supergroup."""
+    if message.chat.type in ("group", "supergroup"):
+        try:
+            await bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+
+# --- Команды ---
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
-        "Привет! Я считаю баллы по хэштегам в комментариях (группа обсуждений).\n\n"
-        "Как набрать очки:\n"
-        "• <b>#челлендж1</b> — <b>+5</b> баллов.\n"
-        "• <b>#балл</b> или <b>#+1</b> — <b>+1</b> балл.\n\n"
+        "Привет! Я считаю баллы по хэштегам в комментариях.\n\n"
+        "Хэштеги:\n"
+        "• #челлендж1 — +5 баллов (ответ бота исчезнет через 5 сек)\n"
+        "• #балл, #+1 и т.п. — +1 балл (ответ бота остаётся)\n\n"
         "Команды:\n"
-        "• /баланс или /моибаллы — твой баланс\n"
-        "• /top — топ-10 по чату\n"
+        "• /баланс или /моибаллы — твой баланс (ответ исчезнет через 5 сек)\n"
+        "• /top — топ-10 по чату (ответ исчезнет через 5 сек)\n"
     )
-    await message.reply(text)
+    await reply_autodel(message, text)
+    await delete_user_command_if_group(message)
 
-@dp.message_handler(commands=["моибаллы", "my", "me", "moi", "moibal", "баланс"])
+@dp.message_handler(commands=["баланс", "моибаллы", "my", "me", "moi", "moibal"])
 async def cmd_balance(message: types.Message):
     pts = get_points(message.chat.id, message.from_user.id)
-    await message.reply(f"Ваш баланс: <b>{pts}</b>")
+    await reply_autodel(message, f"Ваш баланс: <b>{pts}</b>")
+    await delete_user_command_if_group(message)
 
 @dp.message_handler(commands=["top", "топ"])
 async def cmd_top(message: types.Message):
     rows = get_top(message.chat.id, limit=10)
     if not rows:
-        await message.reply("Пока пусто. Напишите #балл или #челлендж1 в этом чате, чтобы начать.")
+        await reply_autodel(message, "Пока пусто. Напишите #балл или #челлендж1, чтобы начать.")
+        await delete_user_command_if_group(message)
         return
     lines = ["🏆 <b>Топ этого чата</b>"]
     for i, (user_id, pts, username, full_name) in enumerate(rows, start=1):
         name = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{full_name}</a>'
         lines.append(f"{i}. {name} — <b>{pts}</b>")
-    await message.reply("\n".join(lines), disable_web_page_preview=True)
+    await reply_autodel(message, "\n".join(lines))
+    await delete_user_command_if_group(message)
 
-# --- Messages / scoring ---
+# --- Сообщения с хэштегами ---
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
+    # учитываем только сообщения в группах/супергруппах (комментарии)
     if message.chat.type not in ("group", "supergroup"):
         return
     if not message.text or (message.from_user and message.from_user.is_bot):
         return
+
     text_lc = message.text.strip().lower()
 
-    if "#челлендж1" in text_lc:
+    # #челлендж1 (+5) → ответ с автоудалением (хэштег пользователя остаётся)
+    if CHALLENGE_TAG in text_lc:
         new_points = add_point(message.chat.id, message.from_user, amount=5)
-        sent = await message.reply(f"✅ Вам засчитано <b>+5</b> баллов! Ваш баланс: <b>{new_points}</b>")
-        async def _autodelete():
-            await asyncio.sleep(5)
-            try:
-                await bot.delete_message(sent.chat.id, sent.message_id)
-            except Exception:
-                pass
-        asyncio.create_task(_autodelete())
+        await reply_autodel(
+            message,
+            f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\nВаш баланс: <b>{new_points}</b>"
+        )
         return
 
+    # Обычные хэштеги (+1) → ответ остаётся (ничего не удаляем)
     if HASHTAG_PATTERN.search(text_lc):
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
-# --- Startup hooks ---
+# --- Startup ---
 async def startup_common():
-    # Проверим токен и снимем/поставим вебхук по режиму
     me = await bot.get_me()
     logger.info(f"Authorized as @{me.username} (id={me.id})")
     if WEBHOOK_URL:
-        # Webhook mode
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True, allowed_updates=["message"])
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
     else:
-        # Polling mode
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted. Using polling.")
 
 def main():
     init_db()
     if WEBHOOK_URL:
-        # --- Webhook mode ---
         parsed = urlparse(WEBHOOK_URL)
         webhook_path = parsed.path or "/webhook"
-        logger.info(f"Starting webhook server on {HOST}:{PORT}, path={webhook_path}")
         executor.start_webhook(
             dispatcher=dp,
             webhook_path=webhook_path,
@@ -171,14 +189,11 @@ def main():
             port=PORT,
         )
     else:
-        # --- Polling mode ---
-        logger.info("Starting bot polling...")
-        try:
-            executor.start_polling(dp, skip_updates=True, on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()))
-        except ConflictError as e:
-            logger.error(f"Polling conflict: {e}")
-            # Если всё же конфликт — предложим явный переход на webhook
-            raise
+        executor.start_polling(
+            dp,
+            skip_updates=True,
+            on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()),
+        )
 
 if __name__ == "__main__":
     main()

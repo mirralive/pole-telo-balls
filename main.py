@@ -1,4 +1,4 @@
- # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import re
 import sqlite3
@@ -96,11 +96,12 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     asyncio.create_task(_autodelete())
 
 async def delete_user_command_if_group(message: types.Message):
-    """Delete user's command message only in group/supergroup."""
+    """Delete user's command message only in group/supergroup (needs admin right: delete messages)."""
     if message.chat.type in ("group", "supergroup"):
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
+            # Скорее всего нет права "Удалять сообщения" → сделайте бота админом группы с этим правом.
             pass
 
 # --- Команды ---
@@ -112,8 +113,8 @@ async def cmd_start(message: types.Message):
         "• #челлендж1 — +5 баллов (ответ бота исчезнет через 5 сек)\n"
         "• #балл, #+1 и т.п. — +1 балл (ответ бота остаётся)\n\n"
         "Команды:\n"
-        "• /баланс или /моибаллы — твой баланс (ответ исчезнет через 5 сек)\n"
-        "• /top — топ-10 по чату (ответ исчезнет через 5 сек)\n"
+        "• /баланс или /моибаллы — твой баланс (ответ исчезнет через 5 сек; команда пользователя удаляется)\n"
+        "• /top — топ-10 по чату (ответ исчезнет через 5 сек; команда пользователя удаляется)\n"
     )
     await reply_autodel(message, text)
     await delete_user_command_if_group(message)
@@ -149,8 +150,16 @@ async def handle_text(message: types.Message):
 
     text_lc = message.text.strip().lower()
 
-    # #челлендж1 (+5) → ответ с автоудалением (хэштег пользователя остаётся)
-    if CHALLENGE_TAG in text_lc:
+    # Собираем хэштеги через entities (надёжнее всего)
+    hashtags = []
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "hashtag":
+                tag = message.text[ent.offset: ent.offset + ent.length]
+                hashtags.append(tag.lower())
+
+    # #челлендж1 (+5) → ответ с автоудалением (сообщение пользователя остаётся)
+    if CHALLENGE_TAG in hashtags or CHALLENGE_TAG in text_lc:
         new_points = add_point(message.chat.id, message.from_user, amount=5)
         await reply_autodel(
             message,
@@ -158,8 +167,14 @@ async def handle_text(message: types.Message):
         )
         return
 
-    # Обычные хэштеги (+1) → ответ остаётся (ничего не удаляем)
-    if HASHTAG_PATTERN.search(text_lc):
+    # Обычные хэштеги (+1) → ответ остаётся
+    plus_one = False
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in hashtags):
+        plus_one = True
+    elif HASHTAG_PATTERN.search(text_lc):
+        plus_one = True
+
+    if plus_one:
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 

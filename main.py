@@ -21,8 +21,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Часовой сдвиг для определения "сегодня" (чтобы дневной лимит считался по твоему времени)
-# Например, для Европы/Амстердама летом поставь TZ_OFFSET_HOURS=2
+# Для правильного «сегодня» по твоему часовому поясу:
+# Для Европы/Амстердама: летом 2, зимой 1
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
 # Хэштеги
@@ -37,9 +37,6 @@ dp = Dispatcher(bot)
 
 # --- Time helpers ---
 def current_local_date() -> date:
-    """
-    Возвращает сегодняшнюю дату с учётом TZ_OFFSET_HOURS.
-    """
     tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return datetime.now(tz).date()
 
@@ -107,6 +104,9 @@ def get_total(chat_id: int) -> int:
         return int(row[0]) if row and row[0] else 0
 
 def can_post_tag(chat_id: int, user_id: int) -> bool:
+    """
+    1 хэштег в день на человека: если уже был — False; если нет — пометить сегодняшним днём и True.
+    """
     today = current_local_date().isoformat()
     with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
         cur.execute("SELECT day FROM last_tag WHERE chat_id=? AND user_id=?", (chat_id, user_id))
@@ -120,11 +120,9 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
         conn.commit()
         return True
 
-# --- Utils: авто-удаление и удаление команды пользователя ---
+# --- Utils: авто-удаление и удаление команд ---
 async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    """
-    Ответить и удалить ОТВЕТ бота через delay секунд.
-    """
+    """Ответить и удалить ОТВЕТ бота через delay секунд."""
     sent = await message.reply(text)
     async def _autodelete():
         await asyncio.sleep(delay)
@@ -135,15 +133,11 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     asyncio.create_task(_autodelete())
 
 async def delete_user_command_if_group(message: types.Message):
-    """
-    Удалить КОМАНДУ пользователя из группы/супергруппы.
-    Требуются права администратора: 'Удалять сообщения'.
-    """
+    """Удалить КОМАНДУ пользователя (нужны права админа «Удалять сообщения»)."""
     if message.chat.type in ("group", "supergroup"):
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
-            # если нет прав — просто молча игнорируем
             pass
 
 # --- Commands ---
@@ -200,8 +194,16 @@ async def handle_text(message: types.Message):
 
     text_lc = message.text.strip().lower()
 
-    # Спец-хэштег +5
-    if CHALLENGE_TAG in text_lc:
+    # соберём хэштеги из entities (надёжнее) + оставим резерв по тексту
+    hashtags = []
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "hashtag":
+                tag = message.text[ent.offset: ent.offset + ent.length].lower()
+                hashtags.append(tag)
+
+    # --- спец-хэштег +5 ---
+    if CHALLENGE_TAG in hashtags or CHALLENGE_TAG in text_lc:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
@@ -212,13 +214,19 @@ async def handle_text(message: types.Message):
         )
         return
 
-    # Обычные +1
-    if HASHTAG_PATTERN.search(text_lc):
+    # --- обычные +1 ---
+    plus_one = False
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in hashtags):
+        plus_one = True
+    elif HASHTAG_PATTERN.search(text_lc):
+        plus_one = True
+
+    if plus_one:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=1)
-        # по твоему требованию подтверждение +1 оставляем висеть
+        # подтверждение +1 оставляем висеть (как просила)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
 # --- Startup ---
@@ -236,7 +244,6 @@ async def startup_common():
 def main():
     init_db()
     if WEBHOOK_URL:
-        from aiogram.utils.executor import start_webhook
         parsed = urlparse(WEBHOOK_URL)
         webhook_path = parsed.path or "/webhook"
         executor.start_webhook(

@@ -164,17 +164,22 @@ async def on_startup(dp: Dispatcher):
 def main():
     init_db()
     logger.info("Starting bot polling...")
-    try:
-        executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-    except ConflictError as e:
-        # На всякий случай ловим конфликт и пробуем ещё раз после сброса вебхука
-        logger.error(f"Polling conflict: {e}")
-        # второй запуск после задержки
-        async def restart():
-            await asyncio.sleep(2)
-            await on_startup(dp)
-            executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-        asyncio.get_event_loop().run_until_complete(restart())
+
+    async def startup_checks():
+        try:
+            me = await bot.get_me()
+            logger.info(f"Bot authorized as @{me.username} (id={me.id})")
+            # Снимем вебхук на всякий случай
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.error(f"Startup auth/webhook check failed: {e}")
+            # При невалидном токене aiogram выдаст Unauthorized — завершимся,
+            # чтобы в логах было понятно, а не бесконечные попытки.
+            raise
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(startup_checks())
+    executor.start_polling(dp, skip_updates=True)
 
 if __name__ == "__main__":
     main()

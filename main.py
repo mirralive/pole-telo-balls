@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import json
 import sqlite3
 import logging
 import asyncio
@@ -9,8 +10,6 @@ from contextlib import closing
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.webhook import get_new_configured_app
-from aiogram.dispatcher.middlewares import BaseMiddleware
 
 # =========================
 #        CONFIG
@@ -34,28 +33,14 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # для «сегод�
 
 # Текстовые параметры
 CHALLENGE_TAG = "#челлендж1"
-CHALLENGE_RE = re.compile(r'(?<!\w)#челлендж1(?!\w)', re.IGNORECASE)
+# допускаем пробелы/невидимые после #, регистр не важен
+CHALLENGE_RE = re.compile(r'(?<!\w)#\s*челлендж1(?!\w)', re.IGNORECASE)
 
 # =========================
 #      BOT + DISPATCHER
 # =========================
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
-
-# ---------- RAW update logger ----------
-class UpdateLogger(BaseMiddleware):
-    async def on_pre_process_update(self, update: types.Update, data: dict):
-        kinds = []
-        if update.message: kinds.append("message")
-        if update.edited_message: kinds.append("edited_message")
-        if update.channel_post: kinds.append("channel_post")
-        if update.edited_channel_post: kinds.append("edited_channel_post")
-        if update.callback_query: kinds.append("callback_query")
-        if update.my_chat_member: kinds.append("my_chat_member")
-        if update.chat_member: kinds.append("chat_member")
-        logger.info("RAW UPDATE TYPES: %s", ",".join(kinds) or "UNKNOWN")
-
-dp.middleware.setup(UpdateLogger())
 
 # =========================
 #         TIME
@@ -243,6 +228,14 @@ async def cmd_all(message: types.Message):
 # =========================
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def on_text(message: types.Message):
+    # Подробный лог входящего текста
+    logger.info(
+        "TEXT_CALL chat_id=%s type=%s from=%s(%s) text=%r entities=%r",
+        message.chat.id, message.chat.type,
+        message.from_user.id, message.from_user.username,
+        message.text, message.entities
+    )
+
     # Только групповые чаты
     if not in_chat(message):
         return
@@ -253,10 +246,21 @@ async def on_text(message: types.Message):
     cleaned = clean_text(raw)
     tags = set(extract_hashtags(message.text, message.entities))
 
-    logger.info("DEBUG(text) chat=%s type=%s text=%r cleaned=%r tags=%r",
-                message.chat.id, message.chat.type, raw, cleaned, tags)
+    # Доп. лог: коды символов (вдруг «похожая» буква)
+    try:
+        codes = " ".join(f"{ord(ch):04x}" for ch in raw)
+        logger.info("TEXT_UNICODE chat=%s codes=%s", message.chat.id, codes)
+    except Exception:
+        pass
 
-    is_challenge = (CHALLENGE_TAG in tags) or bool(CHALLENGE_RE.search(cleaned))
+    logger.info("DEBUG(text) chat=%s type=%s cleaned=%r tags=%r",
+                message.chat.id, message.chat.type, cleaned, tags)
+
+    is_challenge = (
+        (CHALLENGE_TAG in tags) or
+        bool(CHALLENGE_RE.search(cleaned)) or
+        ("челлендж1" in cleaned and "#" in cleaned)  # резервный путь
+    )
     if not is_challenge:
         return
 
@@ -294,7 +298,11 @@ async def on_media(message: types.Message):
     logger.info("DEBUG(media) chat=%s type=%s caption=%r cleaned=%r tags=%r",
                 message.chat.id, message.chat.type, caption, cleaned, tags)
 
-    is_challenge = (CHALLENGE_TAG in tags) or bool(CHALLENGE_RE.search(cleaned))
+    is_challenge = (
+        (CHALLENGE_TAG in tags) or
+        bool(CHALLENGE_RE.search(cleaned)) or
+        ("челлендж1" in cleaned and "#" in cleaned)
+    )
     if not is_challenge:
         return
 
@@ -310,21 +318,30 @@ async def on_media(message: types.Message):
         delay=5
     )
 
-# =========================
-#  LOG CHANNEL POSTS (debug only)
-# =========================
-@dp.channel_post_handler(content_types=types.ContentType.ANY)
-async def on_channel_post(msg: types.Message):
-    # Ничего не делаем в канале, только логируем, чтобы понять, что именно приходит
-    logger.info("DEBUG(channel_post) chat_type=%s text=%r caption=%r entities=%r caption_entities=%r",
-                msg.chat.type, getattr(msg, "text", None), getattr(msg, "caption", None),
-                getattr(msg, "entities", None), getattr(msg, "caption_entities", None))
+# ---------- временный «эхо»-хэндлер для любого текста (чтобы точно увидеть реакцию бота)
+@dp.message_handler(lambda m: m.content_type == types.ContentType.TEXT and m.text)
+async def _echo_tmp(message: types.Message):
+    # Только для чатов, чтобы не мешать личке; удаляется через 5 сек
+    if in_chat(message):
+        await reply_autodel(message, f"👀 вижу текст: <code>{message.text}</code>", delay=5)
 
 # =========================
-#  STARTUP / SHUTDOWN / APP
+#  CATCH-ALL LOG (на всякий случай)
+# =========================
+@dp.message_handler(content_types=types.ContentType.ANY)
+async def _catch_all(message: types.Message):
+    logger.info(
+        "CATCHALL chat_id=%s type=%s content_type=%s text=%r caption=%r entities=%r caption_entities=%r",
+        message.chat.id, message.chat.type, message.content_type,
+        getattr(message, "text", None), getattr(message, "caption", None),
+        getattr(message, "entities", None), getattr(message, "caption_entities", None)
+    )
+
+# =========================
+#  STARTUP / SHUTDOWN
 # =========================
 async def on_startup(app: web.Application):
-    # ВАЖНО: не ограничиваем allowed_updates → получаем ВСЕ типы
+    # не ограничиваем allowed_updates — пусть прилетает всё
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
@@ -340,21 +357,38 @@ async def on_shutdown(app: web.Application):
         pass
     logger.info("👋 Shutdown complete")
 
+# =========================
+#  AIOHTTP APP & RAW WEBHOOK
+# =========================
+async def webhook_handler(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    # Сырой лог апдейта (чтобы видеть, что реально присылает Telegram)
+    logger.info("RAW JSON: %s", json.dumps(data, ensure_ascii=False))
+    try:
+        update = types.Update.to_object(data)
+        await dp.process_update(update)
+    except Exception as e:
+        logger.exception("Failed to process update: %s", e)
+    return web.Response(text="ok")
+
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
 def create_app() -> web.Application:
-    # aiogram-приложение с настроенным роутом на WEBHOOK_URL.path
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    # Путь вебхука берём из переменной (должен совпадать с WEBHOOK_URL)
     from urllib.parse import urlparse
     parsed = urlparse(WEBHOOK_URL)
     webhook_path = parsed.path or "/webhook"
 
-    app = get_new_configured_app(dp, webhook_path)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    # healthcheck для Render
-    async def health(request):
-        return web.Response(text="OK")
     app.router.add_get("/", health)
-
+    app.router.add_post(webhook_path, webhook_handler)
     return app
 
 if __name__ == "__main__":

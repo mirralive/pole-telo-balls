@@ -6,7 +6,6 @@ import sqlite3
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone, date
-from contextlib import closing
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -29,11 +28,10 @@ PORT = int(os.getenv("PORT", "10000"))
 HOST = "0.0.0.0"
 
 DB_PATH = os.getenv("DB_PATH", "scores.db")
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # для «сегодня»
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # смещение для "сегодня"
 
-# Текстовые параметры
+# Правила
 CHALLENGE_TAG = "#челлендж1"
-# допускаем пробелы/невидимые после #, регистр не важен
 CHALLENGE_RE = re.compile(r'(?<!\w)#\s*челлендж1(?!\w)', re.IGNORECASE)
 
 # =========================
@@ -135,8 +133,15 @@ def can_tag_today(chat_id: int, user_id: int) -> bool:
 #      HELPERS / UI
 # =========================
 async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    """Ответ бота, который удалится через delay секунд."""
-    sent = await message.reply(text)
+    """
+    Отправляет ответ бота и удаляет его через delay секунд.
+    ВНИМАНИЕ: не используем message.reply() — чтобы не зависеть от aiogram context!
+    """
+    sent = await bot.send_message(
+        chat_id=message.chat.id,
+        text=text,
+        reply_to_message_id=message.message_id  # визуально как reply
+    )
     async def _autodel():
         await asyncio.sleep(delay)
         try:
@@ -152,8 +157,17 @@ async def delete_user_command(message: types.Message):
     except Exception:
         pass
 
-def in_chat(message: types.Message) -> bool:
+def in_group(message: types.Message) -> bool:
     return message.chat and message.chat.type in ("group", "supergroup")
+
+def is_anonymous_admin(msg: types.Message) -> bool:
+    # Сообщение «от имени чата»: from_user — бот GroupAnonymousBot, sender_chat — группа/супергруппа
+    return (
+        msg.from_user is not None
+        and msg.from_user.is_bot
+        and msg.sender_chat is not None
+        and msg.sender_chat.type in ("group", "supergroup")
+    )
 
 def clean_text(s: str) -> str:
     if not s:
@@ -190,14 +204,14 @@ async def cmd_start(message: types.Message):
         "• /all — суммарный счёт всех участников (удаляется через 5 сек)\n"
     )
     await reply_autodel(message, text)
-    if in_chat(message):
+    if in_group(message):
         await delete_user_command(message)
 
 @dp.message_handler(commands=["баланс"])
 async def cmd_balance(message: types.Message):
     pts = get_points(message.chat.id, message.from_user.id)
     await reply_autodel(message, f"💰 Ваш баланс: <b>{pts}</b> баллов", delay=5)
-    if in_chat(message):
+    if in_group(message):
         await delete_user_command(message)
 
 @dp.message_handler(commands=["top", "топ"])
@@ -205,7 +219,7 @@ async def cmd_top(message: types.Message):
     rows = get_top(message.chat.id, limit=10)
     if not rows:
         await reply_autodel(message, "📭 Пока пусто. Начните с <b>#челлендж1</b>!")
-        if in_chat(message):
+        if in_group(message):
             await delete_user_command(message)
         return
     lines = ["🏆 <b>Топ-10 этого чата</b>"]
@@ -213,14 +227,14 @@ async def cmd_top(message: types.Message):
         name = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{full_name}</a>'
         lines.append(f"{i}. {name} — <b>{pts}</b> баллов")
     await reply_autodel(message, "\n".join(lines))
-    if in_chat(message):
+    if in_group(message):
         await delete_user_command(message)
 
 @dp.message_handler(commands=["all", "общий"])
 async def cmd_all(message: types.Message):
     total = get_total(message.chat.id)
     await reply_autodel(message, f"🌍 Общий счёт всех участников: <b>{total}</b> баллов")
-    if in_chat(message):
+    if in_group(message):
         await delete_user_command(message)
 
 # =========================
@@ -228,16 +242,15 @@ async def cmd_all(message: types.Message):
 # =========================
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def on_text(message: types.Message):
-    # Подробный лог входящего текста
-    logger.info(
-        "TEXT_CALL chat_id=%s type=%s from=%s(%s) text=%r entities=%r",
-        message.chat.id, message.chat.type,
-        message.from_user.id, message.from_user.username,
-        message.text, message.entities
-    )
-
-    # Только групповые чаты
-    if not in_chat(message):
+    if not in_group(message):
+        return
+    if is_anonymous_admin(message):
+        await reply_autodel(
+            message,
+            "ℹ️ Сообщение отправлено от имени чата.\n"
+            "Чтобы получить баллы, напишите хэштег <b>от своего имени</b>.",
+            delay=5
+        )
         return
     if message.from_user and message.from_user.is_bot:
         return
@@ -245,21 +258,13 @@ async def on_text(message: types.Message):
     raw = message.text or ""
     cleaned = clean_text(raw)
     tags = set(extract_hashtags(message.text, message.entities))
-
-    # Доп. лог: коды символов (вдруг «похожая» буква)
-    try:
-        codes = " ".join(f"{ord(ch):04x}" for ch in raw)
-        logger.info("TEXT_UNICODE chat=%s codes=%s", message.chat.id, codes)
-    except Exception:
-        pass
-
     logger.info("DEBUG(text) chat=%s type=%s cleaned=%r tags=%r",
                 message.chat.id, message.chat.type, cleaned, tags)
 
     is_challenge = (
         (CHALLENGE_TAG in tags) or
         bool(CHALLENGE_RE.search(cleaned)) or
-        ("челлендж1" in cleaned and "#" in cleaned)  # резервный путь
+        ("челлендж1" in cleaned and "#" in cleaned)
     )
     if not is_challenge:
         return
@@ -286,7 +291,15 @@ async def on_text(message: types.Message):
     types.ContentType.VIDEO_NOTE,
 ])
 async def on_media(message: types.Message):
-    if not in_chat(message):
+    if not in_group(message):
+        return
+    if is_anonymous_admin(message):
+        await reply_autodel(
+            message,
+            "ℹ️ Сообщение отправлено от имени чата.\n"
+            "Чтобы получить баллы, прикрепите медиа и хэштег <b>от своего имени</b>.",
+            delay=5
+        )
         return
     if message.from_user and message.from_user.is_bot:
         return
@@ -294,9 +307,8 @@ async def on_media(message: types.Message):
     caption = message.caption or ""
     cleaned = clean_text(caption)
     tags = set(extract_hashtags(message.caption, message.caption_entities))
-
-    logger.info("DEBUG(media) chat=%s type=%s caption=%r cleaned=%r tags=%r",
-                message.chat.id, message.chat.type, caption, cleaned, tags)
+    logger.info("DEBUG(media) chat=%s type=%s cleaned=%r tags=%r",
+                message.chat.id, message.chat.type, cleaned, tags)
 
     is_challenge = (
         (CHALLENGE_TAG in tags) or
@@ -318,30 +330,10 @@ async def on_media(message: types.Message):
         delay=5
     )
 
-# ---------- временный «эхо»-хэндлер для любого текста (чтобы точно увидеть реакцию бота)
-@dp.message_handler(lambda m: m.content_type == types.ContentType.TEXT and m.text)
-async def _echo_tmp(message: types.Message):
-    # Только для чатов, чтобы не мешать личке; удаляется через 5 сек
-    if in_chat(message):
-        await reply_autodel(message, f"👀 вижу текст: <code>{message.text}</code>", delay=5)
-
-# =========================
-#  CATCH-ALL LOG (на всякий случай)
-# =========================
-@dp.message_handler(content_types=types.ContentType.ANY)
-async def _catch_all(message: types.Message):
-    logger.info(
-        "CATCHALL chat_id=%s type=%s content_type=%s text=%r caption=%r entities=%r caption_entities=%r",
-        message.chat.id, message.chat.type, message.content_type,
-        getattr(message, "text", None), getattr(message, "caption", None),
-        getattr(message, "entities", None), getattr(message, "caption_entities", None)
-    )
-
 # =========================
 #  STARTUP / SHUTDOWN
 # =========================
 async def on_startup(app: web.Application):
-    # не ограничиваем allowed_updates — пусть прилетает всё
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
@@ -355,6 +347,17 @@ async def on_shutdown(app: web.Application):
         await bot.delete_webhook()
     except Exception:
         pass
+    try:
+        storage = getattr(dp, "storage", None)
+        if storage is not None:
+            await storage.close()
+            await storage.wait_closed()
+    except Exception:
+        pass
+    try:
+        await bot.session.close()   # важно, чтобы не было Unclosed client session
+    except Exception:
+        pass
     logger.info("👋 Shutdown complete")
 
 # =========================
@@ -365,7 +368,6 @@ async def webhook_handler(request: web.Request) -> web.Response:
         data = await request.json()
     except Exception:
         data = {}
-    # Сырой лог апдейта (чтобы видеть, что реально присылает Telegram)
     logger.info("RAW JSON: %s", json.dumps(data, ensure_ascii=False))
     try:
         update = types.Update.to_object(data)
@@ -378,14 +380,13 @@ async def health(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 def create_app() -> web.Application:
-    app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    # Путь вебхука берём из переменной (должен совпадать с WEBHOOK_URL)
     from urllib.parse import urlparse
     parsed = urlparse(WEBHOOK_URL)
     webhook_path = parsed.path or "/webhook"
+
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
     app.router.add_get("/", health)
     app.router.add_post(webhook_path, webhook_handler)

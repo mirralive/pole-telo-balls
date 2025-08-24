@@ -23,12 +23,14 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # если указано �
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Для правильного «сегодня» по твоему часовому поясу (Амстердам: лето 2, зима 1)
+# часовой пояс для "сегодня"
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
-# Паттерны хэштегов (плюс один)
-PLUS_ONE_PATTERN = re.compile(r"(?i)(^|\s)#\s*\+\s*1(\s|$)|(^|\s)#балл(ы)?(\s|$)|(^|\s)#очки(\s|$)|(^|\s)#score(\s|$)|(^|\s)#point(s)?(\s|$)")
-CHALLENGE_CANON = "#челлендж1"  # ловим и как entity, и как «голый текст»
+# Паттерны
+PLUS_ONE_PATTERN = re.compile(
+    r"(?i)(^|\s)#\s*\+\s*1(\s|$)|(^|\s)#балл(ы)?(\s|$)|(^|\s)#очки(\s|$)|(^|\s)#score(\s|$)|(^|\s)#points?(\s|$)"
+)
+CHALLENGE_CANON = "#челлендж1"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
@@ -128,12 +130,7 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
 # =========================
 #     TEXT NORMALIZATION
 # =========================
-ZERO_WIDTH = "".join([
-    "\u200b",  # zero width space
-    "\u200c",  # zero width non-joiner
-    "\u200d",  # zero width joiner
-    "\ufeff",  # BOM
-])
+ZERO_WIDTH = "".join(["\u200b", "\u200c", "\u200d", "\ufeff"])
 
 def clean_text(s: str) -> str:
     """чистим невидимые символы/переводы строк, убираем пробелы после '#', -> lower()."""
@@ -172,11 +169,14 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
 
 async def delete_user_command_if_group(message: types.Message):
     """Удаляем САМО сообщение пользователя с командой (нужны права «Удалять сообщения»)."""
-    if message.chat.type in ("group", "supergroup"):
+    if message.chat and message.chat.type in ("group", "supergroup"):
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
+
+def is_group(message: types.Message) -> bool:
+    return message.chat and message.chat.type in ("group", "supergroup")
 
 # =========================
 #        COMMANDS
@@ -224,12 +224,8 @@ async def cmd_all(message: types.Message):
     await delete_user_command_if_group(message)
 
 # =========================
-#    GROUP/SUPERGROUP ONLY
+#   GROUP TEXT HANDLER
 # =========================
-def is_group(message: types.Message) -> bool:
-    return message.chat and message.chat.type in ("group", "supergroup")
-
-# ТЕКСТ в группе/супергруппе
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_group_text(message: types.Message):
     if not is_group(message):
@@ -241,11 +237,10 @@ async def handle_group_text(message: types.Message):
     cleaned = clean_text(raw)
     tags = set(extract_hashtags_from(message.text, message.entities))
 
-    # Диагностика — обязательно увидим вход и что получилось
     logger.info("DEBUG(group-text) chat=%s user=%s text=%r cleaned=%r tags=%r",
                 message.chat.id, message.from_user.id if message.from_user else None, raw, cleaned, tags)
 
-    # --- CHALLENGE +5 ---
+    # CHALLENGE +5
     if (CHALLENGE_CANON in tags) or re.search(r'(?<!\w)#челлендж1(?!\w)', cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
@@ -254,7 +249,7 @@ async def handle_group_text(message: types.Message):
         await reply_autodel(message, f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\n💰 Ваш баланс: <b>{new_points}</b>")
         return
 
-    # --- PLUS ONE +1 ---
+    # PLUS ONE +1
     if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags) \
        or PLUS_ONE_PATTERN.search(cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
@@ -263,7 +258,9 @@ async def handle_group_text(message: types.Message):
         new_points = add_point(message.chat.id, message.from_user, amount=1)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
-# МЕДИА с подписью в группе/супергруппе (фото/видео/док и т.д.)
+# =========================
+#   GROUP MEDIA (caption)
+# =========================
 @dp.message_handler(content_types=[
     types.ContentType.PHOTO,
     types.ContentType.VIDEO,
@@ -286,7 +283,7 @@ async def handle_group_media(message: types.Message):
     logger.info("DEBUG(group-media) chat=%s user=%s caption=%r cleaned=%r tags=%r",
                 message.chat.id, message.from_user.id if message.from_user else None, caption, cleaned, tags)
 
-    # --- CHALLENGE +5 ---
+    # CHALLENGE +5
     if (CHALLENGE_CANON in tags) or re.search(r'(?<!\w)#челлендж1(?!\w)', cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
@@ -295,7 +292,7 @@ async def handle_group_media(message: types.Message):
         await reply_autodel(message, f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\n💰 Ваш баланс: <b>{new_points}</b>")
         return
 
-    # --- PLUS ONE +1 ---
+    # PLUS ONE +1
     if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags) \
        or PLUS_ONE_PATTERN.search(cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
@@ -305,6 +302,21 @@ async def handle_group_media(message: types.Message):
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
 # =========================
+#   CATCH-ALL DEBUG (group)
+# =========================
+@dp.message_handler(content_types=types.ContentType.ANY)
+async def catch_all_group(message: types.Message):
+    """Ловим вообще всё в группе — чисто чтобы увидеть, что доезжает."""
+    if not is_group(message):
+        return
+    logger.info("CATCH-ALL(group) type=%s text=%r caption=%r entities=%r caption_entities=%r",
+                message.content_type,
+                getattr(message, "text", None),
+                getattr(message, "caption", None),
+                getattr(message, "entities", None),
+                getattr(message, "caption_entities", None))
+
+# =========================
 #        STARTUP
 # =========================
 async def startup_common():
@@ -312,7 +324,12 @@ async def startup_common():
     logger.info(f"Authorized as @{me.username} (id={me.id})")
     if WEBHOOK_URL:
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        # Гарантируем получение сообщений из чатов:
+        await bot.set_webhook(
+            WEBHOOK_URL,
+            drop_pending_updates=True,
+            allowed_updates=["message", "edited_message"]
+        )
         logger.info(f"Webhook set to {WEBHOOK_URL}")
     else:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -327,7 +344,7 @@ def main():
             dispatcher=dp,
             webhook_path=webhook_path,
             on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()),
-            skip_updates=True,
+            skip_updates=True,  # старые апдейты чистим
             host=HOST,
             port=PORT,
         )

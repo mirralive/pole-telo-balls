@@ -10,6 +10,7 @@ from contextlib import closing
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.dispatcher.webhook import get_new_configured_app
+from aiogram.dispatcher.middlewares import BaseMiddleware
 
 # =========================
 #        CONFIG
@@ -40,6 +41,21 @@ CHALLENGE_RE = re.compile(r'(?<!\w)#челлендж1(?!\w)', re.IGNORECASE)
 # =========================
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
+
+# ---------- RAW update logger ----------
+class UpdateLogger(BaseMiddleware):
+    async def on_pre_process_update(self, update: types.Update, data: dict):
+        kinds = []
+        if update.message: kinds.append("message")
+        if update.edited_message: kinds.append("edited_message")
+        if update.channel_post: kinds.append("channel_post")
+        if update.edited_channel_post: kinds.append("edited_channel_post")
+        if update.callback_query: kinds.append("callback_query")
+        if update.my_chat_member: kinds.append("my_chat_member")
+        if update.chat_member: kinds.append("chat_member")
+        logger.info("RAW UPDATE TYPES: %s", ",".join(kinds) or "UNKNOWN")
+
+dp.middleware.setup(UpdateLogger())
 
 # =========================
 #         TIME
@@ -227,6 +243,7 @@ async def cmd_all(message: types.Message):
 # =========================
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def on_text(message: types.Message):
+    # Только групповые чаты
     if not in_chat(message):
         return
     if message.from_user and message.from_user.is_bot:
@@ -294,16 +311,22 @@ async def on_media(message: types.Message):
     )
 
 # =========================
+#  LOG CHANNEL POSTS (debug only)
+# =========================
+@dp.channel_post_handler(content_types=types.ContentType.ANY)
+async def on_channel_post(msg: types.Message):
+    # Ничего не делаем в канале, только логируем, чтобы понять, что именно приходит
+    logger.info("DEBUG(channel_post) chat_type=%s text=%r caption=%r entities=%r caption_entities=%r",
+                msg.chat.type, getattr(msg, "text", None), getattr(msg, "caption", None),
+                getattr(msg, "entities", None), getattr(msg, "caption_entities", None))
+
+# =========================
 #  STARTUP / SHUTDOWN / APP
 # =========================
 async def on_startup(app: web.Application):
-    # ставим свежий вебхук
+    # ВАЖНО: не ограничиваем allowed_updates → получаем ВСЕ типы
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(
-        WEBHOOK_URL,
-        drop_pending_updates=True,
-        allowed_updates=["message", "edited_message"]
-    )
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
 
     init_db()
@@ -318,8 +341,7 @@ async def on_shutdown(app: web.Application):
     logger.info("👋 Shutdown complete")
 
 def create_app() -> web.Application:
-    # aiogram-приложение с настроенным роутом на WEBHOOK_PATH
-    # ВАЖНО: сюда нужно передать dispatcher и строковый path
+    # aiogram-приложение с настроенным роутом на WEBHOOK_URL.path
     from urllib.parse import urlparse
     parsed = urlparse(WEBHOOK_URL)
     webhook_path = parsed.path or "/webhook"

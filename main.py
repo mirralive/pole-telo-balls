@@ -343,10 +343,13 @@ async def on_startup(app: web.Application):
     logger.info(f"🤖 Authorized as @{me.username} (id={me.id})")
 
 async def on_shutdown(app: web.Application):
+    # 1) снимаем вебхук (после него запроса к API больше не будет)
     try:
         await bot.delete_webhook()
     except Exception:
         pass
+
+    # 2) закрываем storage (если когда-нибудь добавишь FSM)
     try:
         storage = getattr(dp, "storage", None)
         if storage is not None:
@@ -354,11 +357,18 @@ async def on_shutdown(app: web.Application):
             await storage.wait_closed()
     except Exception:
         pass
+
+    # 3) корректно закрываем самого бота (внутри закроется ClientSession)
     try:
-        await bot.session.close()   # важно, чтобы не было Unclosed client session
+        await bot.close()          # предпочтительнее, чем напрямую session.close()
     except Exception:
         pass
+
+    # 4) даём event loop «тик», чтобы aiohttp успел закрыть коннекторы
+    await asyncio.sleep(0)
+
     logger.info("👋 Shutdown complete")
+
 
 # =========================
 #  AIOHTTP APP & RAW WEBHOOK

@@ -9,6 +9,7 @@ from contextlib import closing
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.dispatcher.middlewares import BaseMiddleware
 
 # =========================
 #        CONFIG
@@ -23,7 +24,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # если указано �
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# часовой пояс для "сегодня"
+# Часовой пояс для "сегодня"
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
 # Паттерны
@@ -37,6 +38,31 @@ logger = logging.getLogger("points-bot")
 
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
+
+# =========================
+#   RAW UPDATE LOGGER
+# =========================
+class UpdateLogger(BaseMiddleware):
+    async def on_pre_process_update(self, update: types.Update, data: dict):
+        # Выведем, что именно пришло (тип апдейта)
+        ut = []
+        if update.message: ut.append("message")
+        if update.edited_message: ut.append("edited_message")
+        if update.channel_post: ut.append("channel_post")
+        if update.edited_channel_post: ut.append("edited_channel_post")
+        if update.callback_query: ut.append("callback_query")
+        if update.inline_query: ut.append("inline_query")
+        if update.chosen_inline_result: ut.append("chosen_inline_result")
+        if update.shipping_query: ut.append("shipping_query")
+        if update.pre_checkout_query: ut.append("pre_checkout_query")
+        if update.poll: ut.append("poll")
+        if update.poll_answer: ut.append("poll_answer")
+        if update.my_chat_member: ut.append("my_chat_member")
+        if update.chat_member: ut.append("chat_member")
+        if update.chat_join_request: ut.append("chat_join_request")
+        logger.info("RAW UPDATE TYPES: %s", ",".join(ut) or "UNKNOWN")
+
+dp.middleware.setup(UpdateLogger())
 
 # =========================
 #       TIME HELPERS
@@ -306,7 +332,7 @@ async def handle_group_media(message: types.Message):
 # =========================
 @dp.message_handler(content_types=types.ContentType.ANY)
 async def catch_all_group(message: types.Message):
-    """Ловим вообще всё в группе — чисто чтобы увидеть, что доезжает."""
+    """Ловим вообще всё в группе — чтобы увидеть, что доезжает."""
     if not is_group(message):
         return
     logger.info("CATCH-ALL(group) type=%s text=%r caption=%r entities=%r caption_entities=%r",
@@ -323,13 +349,9 @@ async def startup_common():
     me = await bot.get_me()
     logger.info(f"Authorized as @{me.username} (id={me.id})")
     if WEBHOOK_URL:
+        # ни на что не «фильтруем» allowed_updates — пусть тг шлёт всё
         await bot.delete_webhook(drop_pending_updates=True)
-        # Гарантируем получение сообщений из чатов:
-        await bot.set_webhook(
-            WEBHOOK_URL,
-            drop_pending_updates=True,
-            allowed_updates=["message", "edited_message"]
-        )
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         logger.info(f"Webhook set to {WEBHOOK_URL}")
     else:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -344,7 +366,7 @@ def main():
             dispatcher=dp,
             webhook_path=webhook_path,
             on_startup=lambda _: asyncio.get_event_loop().create_task(startup_common()),
-            skip_updates=True,  # старые апдейты чистим
+            skip_updates=True,
             host=HOST,
             port=PORT,
         )

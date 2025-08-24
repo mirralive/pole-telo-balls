@@ -10,24 +10,25 @@ from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, executor, types
 
-# --- Config ---
+# =========================
+#        CONFIG
+# =========================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
 if not TOKEN:
     raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN).")
 
 DB_PATH = os.getenv("DB_PATH", "scores.db")
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # если указано — вебхуки; иначе polling
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Для правильного «сегодня» по твоему часовому поясу:
-# Для Европы/Амстердама: летом 2, зимой 1
+# Для правильного «сегодня» по твоему часовому поясу (Амстердам: лето 2, зима 1)
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
-# Хэштеги
-HASHTAG_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
-CHALLENGE_TAG = "#челлендж1"  # эталон, с которым сравниваем после нормализации
+# Паттерны хэштегов
+PLUS_ONE_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
+CHALLENGE_TEXT = "#челлендж1"  # будем искать и как entity, и как голый текст
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
@@ -35,21 +36,25 @@ logger = logging.getLogger("points-bot")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-# --- Time helpers ---
+# =========================
+#       TIME HELPERS
+# =========================
 def current_local_date() -> date:
     tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return datetime.now(tz).date()
 
-# --- DB ---
+# =========================
+#        DATABASE
+# =========================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS scores (
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            points  INTEGER NOT NULL DEFAULT 0,
-            username TEXT,
-            full_name TEXT,
+            chat_id    INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            points     INTEGER NOT NULL DEFAULT 0,
+            username   TEXT,
+            full_name  TEXT,
             PRIMARY KEY (chat_id, user_id)
         )
         """)
@@ -57,7 +62,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS last_tag (
             chat_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
-            day TEXT NOT NULL,
+            day     TEXT NOT NULL,
             PRIMARY KEY (chat_id, user_id)
         )
         """)
@@ -67,16 +72,21 @@ def add_point(chat_id: int, user: types.User, amount: int = 1) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         with closing(conn.cursor()) as cur:
+            # вставим пользователя, если его ещё нет
             cur.execute("""
                 INSERT INTO scores(chat_id, user_id, points, username, full_name)
                 VALUES (?, ?, 0, ?, ?)
                 ON CONFLICT(chat_id, user_id) DO NOTHING
             """, (chat_id, user.id, user.username or "", f"{user.full_name}"))
+
+            # начислим баллы
             cur.execute("""
-                UPDATE scores SET points = points + ?, username = ?, full_name = ?
+                UPDATE scores
+                SET points = points + ?, username = ?, full_name = ?
                 WHERE chat_id = ? AND user_id = ?
             """, (amount, user.username or "", f"{user.full_name}", chat_id, user.id))
             conn.commit()
+
             cur.execute("SELECT points FROM scores WHERE chat_id = ? AND user_id = ?", (chat_id, user.id))
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -91,7 +101,8 @@ def get_top(chat_id: int, limit: int = 10):
     with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
         cur.execute("""
             SELECT user_id, points, COALESCE(username, ''), COALESCE(full_name, 'Без имени')
-            FROM scores WHERE chat_id = ?
+            FROM scores
+            WHERE chat_id = ?
             ORDER BY points DESC, user_id ASC
             LIMIT ?
         """, (chat_id, limit))
@@ -105,7 +116,9 @@ def get_total(chat_id: int) -> int:
 
 def can_post_tag(chat_id: int, user_id: int) -> bool:
     """
-    1 хэштег в день на человека: если уже был — False; если нет — пометить сегодняшним днём и True.
+    Лимит: 1 хэштег в день на человека.
+    True — можно начислять (и мы отметим день),
+    False — уже был хэштег сегодня.
     """
     today = current_local_date().isoformat()
     with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
@@ -113,6 +126,7 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
         row = cur.fetchone()
         if row and row[0] == today:
             return False
+        # отмечаем сегодняшний день
         cur.execute("""
             INSERT INTO last_tag(chat_id, user_id, day) VALUES (?, ?, ?)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET day=excluded.day
@@ -120,43 +134,25 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
         conn.commit()
         return True
 
-# --- Utils ---
-def normalize_tag(tag: str) -> str:
+# =========================
+#         UTILS
+# =========================
+def extract_hashtags_from(text: str, entities) -> list:
     """
-    Приводим хэштег к униформе: нижний регистр, убираем пробелы после #, обрезаем вокруг.
-    Пример: '# Челлендж1 ' -> '#челлендж1'
-    """
-    if not tag:
-        return tag
-    t = tag.strip().lower()
-    if t.startswith("#"):
-        # убираем любые пробелы сразу после '#'
-        t = "#" + t[1:].lstrip()
-    return t
-
-def extract_hashtags(message: types.Message):
-    """
-    Достаём хэштеги из:
-    - message.text + message.entities
-    - message.caption + message.caption_entities (для фото/видео с подписью)
-    Возвращаем список НОРМАЛИЗОВАННЫХ тегов (normalize_tag).
+    Возвращает список хэштегов в нижнем регистре из текста по entities.
+    Если entities нет — вернётся пустой список (поэтому ниже мы всегда ещё смотрим «голый текст»).
     """
     tags = []
-
-    def collect(text, entities):
-        if not text or not entities:
-            return
-        for ent in entities:
-            if ent.type == "hashtag":
-                tag = text[ent.offset: ent.offset + ent.length]
-                tags.append(normalize_tag(tag))
-
-    collect(message.text, message.entities)
-    collect(getattr(message, "caption", None), getattr(message, "caption_entities", None))
+    if not text or not entities:
+        return tags
+    for ent in entities:
+        if ent.type == "hashtag":
+            tag = text[ent.offset: ent.offset + ent.length].lower().strip()
+            tags.append(tag)
     return tags
 
 async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    """Ответить и удалить ОТВЕТ бота через delay секунд."""
+    """Ответ бота, который удалится через delay секунд."""
     sent = await message.reply(text)
     async def _autodelete():
         await asyncio.sleep(delay)
@@ -167,14 +163,16 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     asyncio.create_task(_autodelete())
 
 async def delete_user_command_if_group(message: types.Message):
-    """Удалить КОМАНДУ пользователя (нужны права админа «Удалять сообщения»)."""
+    """Удаляем САМО сообщение пользователя с командой (требуются права 'Удалять сообщения')."""
     if message.chat.type in ("group", "supergroup"):
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
 
-# --- Commands ---
+# =========================
+#        COMMANDS
+# =========================
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
@@ -182,11 +180,11 @@ async def cmd_start(message: types.Message):
         "📌 Хэштеги:\n"
         "• <b>#челлендж1</b> → <b>+5</b> баллов (ответ бота исчезнет через 5 сек)\n"
         "• <b>#балл</b>, <b>#+1</b> и т.п. → <b>+1</b> балл (ответ остаётся)\n\n"
-        "⏳ Ограничение: <b>1 хэштег в день</b> на человека.\n\n"
+        "⏳ Лимит: <b>1 хэштег в день</b> на человека.\n\n"
         "🔧 Команды:\n"
-        "• /баланс → твой личный счёт\n"
-        "• /top → топ-10 участников\n"
-        "• /all → общий счёт всех участников\n"
+        "• /баланс — твой личный счёт\n"
+        "• /top — топ-10 участников\n"
+        "• /all — общий счёт всех участников\n"
     )
     await reply_autodel(message, text)
     await delete_user_command_if_group(message)
@@ -217,7 +215,9 @@ async def cmd_all(message: types.Message):
     await reply_autodel(message, f"🌍 Общий счёт всех участников: <b>{total}</b> баллов")
     await delete_user_command_if_group(message)
 
-# --- Hashtags handler (любой контент с текстом/подписью) ---
+# =========================
+#     HASHTAGS HANDLER
+# =========================
 @dp.message_handler(content_types=types.ContentType.ANY)
 async def handle_any(message: types.Message):
     # работаем только в группах/супергруппах
@@ -226,17 +226,27 @@ async def handle_any(message: types.Message):
     if (message.from_user and message.from_user.is_bot):
         return
 
-    # берём и text, и caption
+    # Берём и текст, и подпись к медиа
     text = (message.text or message.caption or "").strip()
     if not text:
         return
 
     text_lc = text.lower()
-    tags = extract_hashtags(message)
 
-    # --- спец-хэштег +5 ---
-    # триггер, если есть нормализованный тег ровно '#челлендж1'
-    if CHALLENGE_TAG in tags or "#челлендж1" in text_lc:
+    # 1) Хэштеги из entities (текст)
+    tags_text = extract_hashtags_from(message.text, message.entities)
+    # 2) Хэштеги из caption_entities (подпись к фото/видео/док)
+    tags_caption = extract_hashtags_from(getattr(message, "caption", None),
+                                         getattr(message, "caption_entities", None))
+    tags = set(tags_text + tags_caption)  # множество, всё в нижнем регистре
+
+    # ---------- CHALLENGE (+5) ----------
+    # триггер, если:
+    #  a) в entities/caption_entities есть ровно '#челлендж1'
+    #  b) или по «голому тексту» встречается подстрока '#челлендж1'
+    is_challenge = (CHALLENGE_TEXT in tags) or (CHALLENGE_TEXT in text_lc)
+
+    if is_challenge:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
@@ -247,24 +257,26 @@ async def handle_any(message: types.Message):
         )
         return
 
-    # --- обычные +1 ---
-    plus_one = False
-    # если в entities/caption_entities есть один из стандартных тегов
+    # ---------- PLUS ONE (+1) ----------
+    is_plus_one = False
+    # через entities/caption_entities
     if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags):
-        plus_one = True
-    # или по текстовой регулярке (поддержка шортформы #+1 и пробелов)
-    elif HASHTAG_PATTERN.search(text_lc):
-        plus_one = True
+        is_plus_one = True
+    # через «голый текст» (регэксп поддерживает варианты с пробелами: # + 1)
+    elif PLUS_ONE_PATTERN.search(text_lc):
+        is_plus_one = True
 
-    if plus_one:
+    if is_plus_one:
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=1)
-        # подтверждение +1 оставляем висеть (как ты просила)
+        # По твоему запросу подтверждение +1 оставляем висеть (не удаляем)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
-# --- Startup ---
+# =========================
+#        STARTUP
+# =========================
 async def startup_common():
     me = await bot.get_me()
     logger.info(f"Authorized as @{me.username} (id={me.id})")

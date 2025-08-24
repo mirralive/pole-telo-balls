@@ -1,6 +1,5 @@
 import logging
 import os
-import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
@@ -11,15 +10,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 
 # ==============================
-# ТОКЕН (берём из переменной окружения, а если нет — используем твой напрямую)
+# ТОКЕН (только из Environment!)
 # ==============================
-TOKEN = os.getenv("BOT_TOKEN", "8427853720:AAGpXCbp-VHpsRxlTvu2DXgqAD7C2rZ_SSM")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN не найден в Environment!")
 
 bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
 # ==============================
-# ПРИМЕР: реакция на текст
+# ПРИМЕР: реакция на хэштег
 # ==============================
 @dp.message_handler(lambda message: message.text and "#челлендж1" in message.text)
 async def handle_challenge(message: types.Message):
@@ -36,5 +37,5 @@ async def handle_balance(message: types.Message):
 # СТАРТ
 # ==============================
 if __name__ == "__main__":
-    logger.info("Starting bot polling...")
+    logger.info("🚀 Starting bot polling...")
     executor.start_polling(dp, skip_updates=True)

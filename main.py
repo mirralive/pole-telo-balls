@@ -6,7 +6,6 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, timezone, date
 from contextlib import closing
-from urllib.parse import urlparse
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -42,14 +41,12 @@ CHALLENGE_RE = re.compile(r'(?<!\w)#челлендж1(?!\w)', re.IGNORECASE)
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-
 # =========================
 #         TIME
 # =========================
 def current_local_date() -> date:
     tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return datetime.now(tz).date()
-
 
 # =========================
 #        DATABASE
@@ -76,40 +73,33 @@ def init_db():
         """)
         conn.commit()
 
-
 def add_points(chat_id: int, user: types.User, amount: int) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
-        with closing(conn.cursor()) as cur:
-            # ensure row exists
-            cur.execute("""
+        with conn:
+            conn.execute("""
                 INSERT INTO scores(chat_id, user_id, points, username, full_name)
                 VALUES (?, ?, 0, ?, ?)
                 ON CONFLICT(chat_id, user_id) DO NOTHING
             """, (chat_id, user.id, user.username or "", user.full_name))
-            # add points
-            cur.execute("""
+            conn.execute("""
                 UPDATE scores
                 SET points = points + ?, username = ?, full_name = ?
                 WHERE chat_id = ? AND user_id = ?
             """, (amount, user.username or "", user.full_name, chat_id, user.id))
-            conn.commit()
-            # return new total
-            cur.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user.id))
+            cur = conn.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user.id))
             row = cur.fetchone()
             return int(row[0]) if row else 0
 
-
 def get_points(chat_id: int, user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         row = cur.fetchone()
         return int(row[0]) if row else 0
 
-
 def get_top(chat_id: int, limit: int = 10):
-    with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
-        cur.execute("""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
             SELECT user_id, points, COALESCE(username,''), COALESCE(full_name,'Без имени')
             FROM scores
             WHERE chat_id=?
@@ -118,30 +108,27 @@ def get_top(chat_id: int, limit: int = 10):
         """, (chat_id, limit))
         return cur.fetchall()
 
-
 def get_total(chat_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT SUM(points) FROM scores WHERE chat_id=?", (chat_id,))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT SUM(points) FROM scores WHERE chat_id=?", (chat_id,))
         row = cur.fetchone()
         return int(row[0]) if row and row[0] else 0
-
 
 def can_tag_today(chat_id: int, user_id: int) -> bool:
     """Лимит: 1 хэштег в день на человека (по чату)."""
     today = current_local_date().isoformat()
-    with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
-        cur.execute("SELECT day FROM last_tag WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT day FROM last_tag WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         row = cur.fetchone()
         if row and row[0] == today:
             return False
-        cur.execute("""
-            INSERT INTO last_tag(chat_id, user_id, day)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET day=excluded.day
-        """, (chat_id, user_id, today))
-        conn.commit()
+        with conn:
+            conn.execute("""
+                INSERT INTO last_tag(chat_id, user_id, day)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET day=excluded.day
+            """, (chat_id, user_id, today))
         return True
-
 
 # =========================
 #      HELPERS / UI
@@ -157,29 +144,24 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
             pass
     asyncio.create_task(_autodel())
 
-
 async def delete_user_command(message: types.Message):
-    """Удаляем САМО сообщение пользователя с командой (требуются права «Удалять сообщения»)."""
+    """Удаляем САМО сообщение пользователя с командой (нужны права «Удалять сообщения»)."""
     try:
         await bot.delete_message(message.chat.id, message.message_id)
     except Exception:
         pass
 
-
 def in_chat(message: types.Message) -> bool:
     return message.chat and message.chat.type in ("group", "supergroup")
-
 
 def clean_text(s: str) -> str:
     if not s:
         return ""
     s = s.replace("\r", "").replace("\n", " ").strip()
-    # убираем невидимые
     for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         s = s.replace(ch, "")
     s = re.sub(r"#\s+", "#", s)
     return s.lower()
-
 
 def extract_hashtags(text: str, entities):
     if not text or not entities:
@@ -189,7 +171,6 @@ def extract_hashtags(text: str, entities):
         if ent.type == "hashtag":
             tags.append(clean_text(text[ent.offset: ent.offset + ent.length]))
     return tags
-
 
 # =========================
 #         COMMANDS
@@ -211,14 +192,12 @@ async def cmd_start(message: types.Message):
     if in_chat(message):
         await delete_user_command(message)
 
-
 @dp.message_handler(commands=["баланс"])
 async def cmd_balance(message: types.Message):
     pts = get_points(message.chat.id, message.from_user.id)
     await reply_autodel(message, f"💰 Ваш баланс: <b>{pts}</b> баллов", delay=5)
     if in_chat(message):
         await delete_user_command(message)
-
 
 @dp.message_handler(commands=["top", "топ"])
 async def cmd_top(message: types.Message):
@@ -236,7 +215,6 @@ async def cmd_top(message: types.Message):
     if in_chat(message):
         await delete_user_command(message)
 
-
 @dp.message_handler(commands=["all", "общий"])
 async def cmd_all(message: types.Message):
     total = get_total(message.chat.id)
@@ -244,13 +222,11 @@ async def cmd_all(message: types.Message):
     if in_chat(message):
         await delete_user_command(message)
 
-
 # =========================
 #     GROUP TEXT / MEDIA
 # =========================
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def on_text(message: types.Message):
-    # работаем только в чатах
     if not in_chat(message):
         return
     if message.from_user and message.from_user.is_bot:
@@ -267,7 +243,6 @@ async def on_text(message: types.Message):
     if not is_challenge:
         return
 
-    # лимит раз в день
     if not can_tag_today(message.chat.id, message.from_user.id):
         await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
         return
@@ -279,7 +254,6 @@ async def on_text(message: types.Message):
         f"💰 Ваш баланс: <b>{new_total}</b>",
         delay=5
     )
-
 
 @dp.message_handler(content_types=[
     types.ContentType.PHOTO,
@@ -319,12 +293,11 @@ async def on_media(message: types.Message):
         delay=5
     )
 
-
 # =========================
 #  STARTUP / SHUTDOWN / APP
 # =========================
 async def on_startup(app: web.Application):
-    # Чистим старый вебхук и ставим новый
+    # ставим свежий вебхук
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(
         WEBHOOK_URL,
@@ -333,11 +306,9 @@ async def on_startup(app: web.Application):
     )
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
 
-    # Инициализируем БД
     init_db()
     me = await bot.get_me()
     logger.info(f"🤖 Authorized as @{me.username} (id={me.id})")
-
 
 async def on_shutdown(app: web.Application):
     try:
@@ -346,21 +317,23 @@ async def on_shutdown(app: web.Application):
         pass
     logger.info("👋 Shutdown complete")
 
-
 def create_app() -> web.Application:
-    # основное aiohttp-приложение
-    app = web.Application()
+    # aiogram-приложение с настроенным роутом на WEBHOOK_PATH
+    # ВАЖНО: сюда нужно передать dispatcher и строковый path
+    from urllib.parse import urlparse
+    parsed = urlparse(WEBHOOK_URL)
+    webhook_path = parsed.path or "/webhook"
+
+    app = get_new_configured_app(dp, webhook_path)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    # aiogram subapp, которое принимает апдейты по WEBHOOK_URL path
-    parsed = urlparse(WEBHOOK_URL)
-    webhook_path = parsed.path or "/webhook"
-    aiogram_app = get_new_configured_app(dp, bot)
-    app.add_subapp(webhook_path, aiogram_app)
+    # healthcheck для Render
+    async def health(request):
+        return web.Response(text="OK")
+    app.router.add_get("/", health)
 
     return app
-
 
 if __name__ == "__main__":
     web.run_app(create_app(), host=HOST, port=PORT)

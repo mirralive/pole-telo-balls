@@ -26,9 +26,9 @@ PORT = int(os.getenv("PORT", "10000"))
 # Для правильного «сегодня» по твоему часовому поясу (Амстердам: лето 2, зима 1)
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 
-# Паттерны хэштегов
-PLUS_ONE_PATTERN = re.compile(r"(?i)(#\s*\+\s*1|#балл(ы)?|#очки|#score|#point|#points)\b")
-CHALLENGE_TEXT = "#челлендж1"  # будем искать и как entity, и как голый текст
+# Паттерны хэштегов (плюс один)
+PLUS_ONE_PATTERN = re.compile(r"(?i)(^|\s)#\s*\+\s*1(\s|$)|(^|\s)#балл(ы)?(\s|$)|(^|\s)#очки(\s|$)|(^|\s)#score(\s|$)|(^|\s)#point(s)?(\s|$)")
+CHALLENGE_CANON = "#челлендж1"  # ловим и как entity, и как «голый текст»
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
@@ -72,21 +72,17 @@ def add_point(chat_id: int, user: types.User, amount: int = 1) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         with closing(conn.cursor()) as cur:
-            # вставим пользователя, если его ещё нет
             cur.execute("""
                 INSERT INTO scores(chat_id, user_id, points, username, full_name)
                 VALUES (?, ?, 0, ?, ?)
                 ON CONFLICT(chat_id, user_id) DO NOTHING
             """, (chat_id, user.id, user.username or "", f"{user.full_name}"))
-
-            # начислим баллы
             cur.execute("""
                 UPDATE scores
                 SET points = points + ?, username = ?, full_name = ?
                 WHERE chat_id = ? AND user_id = ?
             """, (amount, user.username or "", f"{user.full_name}", chat_id, user.id))
             conn.commit()
-
             cur.execute("SELECT points FROM scores WHERE chat_id = ? AND user_id = ?", (chat_id, user.id))
             row = cur.fetchone()
             return int(row[0]) if row else 0
@@ -115,18 +111,13 @@ def get_total(chat_id: int) -> int:
         return int(row[0]) if row and row[0] else 0
 
 def can_post_tag(chat_id: int, user_id: int) -> bool:
-    """
-    Лимит: 1 хэштег в день на человека.
-    True — можно начислять (и мы отметим день),
-    False — уже был хэштег сегодня.
-    """
+    """Лимит: 1 хэштег в день на человека (в группах/супергруппах)."""
     today = current_local_date().isoformat()
     with sqlite3.connect(DB_PATH) as conn, closing(conn.cursor()) as cur:
         cur.execute("SELECT day FROM last_tag WHERE chat_id=? AND user_id=?", (chat_id, user_id))
         row = cur.fetchone()
         if row and row[0] == today:
             return False
-        # отмечаем сегодняшний день
         cur.execute("""
             INSERT INTO last_tag(chat_id, user_id, day) VALUES (?, ?, ?)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET day=excluded.day
@@ -137,7 +128,6 @@ def can_post_tag(chat_id: int, user_id: int) -> bool:
 # =========================
 #     TEXT NORMALIZATION
 # =========================
-# набор невидимых символов, которые часто мешают
 ZERO_WIDTH = "".join([
     "\u200b",  # zero width space
     "\u200c",  # zero width non-joiner
@@ -146,13 +136,7 @@ ZERO_WIDTH = "".join([
 ])
 
 def clean_text(s: str) -> str:
-    """
-    Чистим текст:
-    - удаляем \r, перевод строки -> пробел
-    - убираем невидимые символы (ZERO WIDTH)
-    - убираем пробелы сразу после '#': "# челлендж1" -> "#челлендж1"
-    - приводим к нижнему регистру
-    """
+    """чистим невидимые символы/переводы строк, убираем пробелы после '#', -> lower()."""
     if not s:
         return ""
     s = s.replace("\r", "").replace("\n", " ").strip()
@@ -162,9 +146,7 @@ def clean_text(s: str) -> str:
     return s.lower()
 
 def extract_hashtags_from(text: str, entities) -> list:
-    """
-    Достаём хэштеги, размеченные Telegram (entities), и прогоняем через clean_text.
-    """
+    """берём хэштеги из entities/caption_entities и прогоняем через clean_text."""
     tags = []
     if not text or not entities:
         return tags
@@ -189,7 +171,7 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     asyncio.create_task(_autodelete())
 
 async def delete_user_command_if_group(message: types.Message):
-    """Удаляем САМО сообщение пользователя с командой (требуются права 'Удалять сообщения')."""
+    """Удаляем САМО сообщение пользователя с командой (нужны права «Удалять сообщения»)."""
     if message.chat.type in ("group", "supergroup"):
         try:
             await bot.delete_message(message.chat.id, message.message_id)
@@ -202,7 +184,7 @@ async def delete_user_command_if_group(message: types.Message):
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     text = (
-        "👋 Привет! Я считаю баллы по хэштегам в комментариях.\n\n"
+        "👋 Привет! Я считаю баллы по хэштегам в чатах.\n\n"
         "📌 Хэштеги:\n"
         "• <b>#челлендж1</b> → <b>+5</b> баллов (ответ бота исчезнет через 5 сек)\n"
         "• <b>#балл</b>, <b>#+1</b> и т.п. → <b>+1</b> балл (ответ остаётся)\n\n"
@@ -231,7 +213,6 @@ async def cmd_top(message: types.Message):
     lines = ["🏆 <b>Топ-10 этого чата</b>"]
     for i, (user_id, pts, username, full_name) in enumerate(rows, start=1):
         name = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{full_name}</a>'
-    # NOTE: username/full_name в HTML безопасно, т.к. aiogram экранирует.
         lines.append(f"{i}. {name} — <b>{pts}</b> баллов")
     await reply_autodel(message, "\n".join(lines))
     await delete_user_command_if_group(message)
@@ -243,76 +224,85 @@ async def cmd_all(message: types.Message):
     await delete_user_command_if_group(message)
 
 # =========================
-#     HASHTAGS HANDLER
+#    GROUP/SUPERGROUP ONLY
 # =========================
-@dp.message_handler(content_types=types.ContentType.ANY)
-async def handle_any(message: types.Message):
-    # работаем только в группах/супергруппах
-    if message.chat.type not in ("group", "supergroup"):
+def is_group(message: types.Message) -> bool:
+    return message.chat and message.chat.type in ("group", "supergroup")
+
+# ТЕКСТ в группе/супергруппе
+@dp.message_handler(content_types=types.ContentType.TEXT)
+async def handle_group_text(message: types.Message):
+    if not is_group(message):
         return
-    if (message.from_user and message.from_user.is_bot):
+    if message.from_user and message.from_user.is_bot:
         return
 
-    raw_text = (message.text or message.caption or "")
-    text_lc = clean_text(raw_text)
+    raw = message.text or ""
+    cleaned = clean_text(raw)
+    tags = set(extract_hashtags_from(message.text, message.entities))
 
-    # DEBUG прямо в начале — видим всё, что реально пришло
-    logger.info(
-        "DEBUG IN: text=%r | cleaned=%r | entities=%r | caption_entities=%r",
-        raw_text,
-        text_lc,
-        getattr(message, "entities", None),
-        getattr(message, "caption_entities", None),
-    )
+    # Диагностика — обязательно увидим вход и что получилось
+    logger.info("DEBUG(group-text) chat=%s user=%s text=%r cleaned=%r tags=%r",
+                message.chat.id, message.from_user.id if message.from_user else None, raw, cleaned, tags)
 
-    # Собираем хэштеги из entities/caption_entities и тоже чистим
-    tags = set(
-        extract_hashtags_from(message.text, message.entities)
-        + extract_hashtags_from(getattr(message, "caption", None), getattr(message, "caption_entities", None))
-    )
-
-    # Ещё один DEBUG — что получилось с тегами после чистки
-    logger.info("DEBUG TAGS: %r", tags)
-
-    # ---------- CHALLENGE (+5) ----------
-    # Ловим как по тегам, так и по «голому тексту» (после чистки).
-    is_challenge = (CHALLENGE_TEXT in tags) or bool(re.search(r'(?<!\w)#челлендж1(?!\w)', text_lc))
-
-    if is_challenge:
+    # --- CHALLENGE +5 ---
+    if (CHALLENGE_CANON in tags) or re.search(r'(?<!\w)#челлендж1(?!\w)', cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=5)
-        await reply_autodel(
-            message,
-            f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\n💰 Ваш баланс: <b>{new_points}</b>"
-        )
+        await reply_autodel(message, f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\n💰 Ваш баланс: <b>{new_points}</b>")
         return
 
-    # ---------- PLUS ONE (+1) ----------
-    is_plus_one = False
-    # через entities/caption_entities (точные формы)
-    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags):
-        is_plus_one = True
-    # резерв по «голому тексту» (регэксп поддерживает варианты с пробелами: # + 1)
-    elif PLUS_ONE_PATTERN.search(text_lc):
-        is_plus_one = True
-
-    if is_plus_one:
+    # --- PLUS ONE +1 ---
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags) \
+       or PLUS_ONE_PATTERN.search(cleaned):
         if not can_post_tag(message.chat.id, message.from_user.id):
             await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
             return
         new_points = add_point(message.chat.id, message.from_user, amount=1)
-        # По твоему запросу подтверждение +1 оставляем висеть (не удаляем)
         await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
-# =========================
-#   DEBUG HANDLER (лог-только)
-# =========================
-@dp.message_handler(lambda m: True, content_types=types.ContentType.TEXT)
-async def debug_all(message: types.Message):
-    # Дополнительный лог: точный вид текста (включая невидимые символы)
-    logger.info(f"DEBUG TEXT repr: {repr(message.text)}")
+# МЕДИА с подписью в группе/супергруппе (фото/видео/док и т.д.)
+@dp.message_handler(content_types=[
+    types.ContentType.PHOTO,
+    types.ContentType.VIDEO,
+    types.ContentType.ANIMATION,
+    types.ContentType.DOCUMENT,
+    types.ContentType.AUDIO,
+    types.ContentType.VOICE,
+    types.ContentType.VIDEO_NOTE,
+])
+async def handle_group_media(message: types.Message):
+    if not is_group(message):
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    caption = message.caption or ""
+    cleaned = clean_text(caption)
+    tags = set(extract_hashtags_from(message.caption, message.caption_entities))
+
+    logger.info("DEBUG(group-media) chat=%s user=%s caption=%r cleaned=%r tags=%r",
+                message.chat.id, message.from_user.id if message.from_user else None, caption, cleaned, tags)
+
+    # --- CHALLENGE +5 ---
+    if (CHALLENGE_CANON in tags) or re.search(r'(?<!\w)#челлендж1(?!\w)', cleaned):
+        if not can_post_tag(message.chat.id, message.from_user.id):
+            await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
+            return
+        new_points = add_point(message.chat.id, message.from_user, amount=5)
+        await reply_autodel(message, f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов.\n💰 Ваш баланс: <b>{new_points}</b>")
+        return
+
+    # --- PLUS ONE +1 ---
+    if any(t in ("#балл", "#баллы", "#очки", "#score", "#point", "#points", "#+1") for t in tags) \
+       or PLUS_ONE_PATTERN.search(cleaned):
+        if not can_post_tag(message.chat.id, message.from_user.id):
+            await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
+            return
+        new_points = add_point(message.chat.id, message.from_user, amount=1)
+        await message.reply(f"✅ Балл засчитан! Теперь у вас <b>{new_points}</b>.")
 
 # =========================
 #        STARTUP

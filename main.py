@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-import json
 import sqlite3
 import logging
 import asyncio
@@ -28,11 +27,11 @@ PORT = int(os.getenv("PORT", "10000"))
 HOST = "0.0.0.0"
 
 DB_PATH = os.getenv("DB_PATH", "scores.db")
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # смещение для "сегодня"
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # смещение для определения "сегодня"
 
-# Правила
-CHALLENGE_TAG = "#челлендж1"
-CHALLENGE_RE = re.compile(r'(?<!\w)#\s*челлендж1(?!\w)', re.IGNORECASE)
+# Настройки правил
+CHALLENGE_TAG = "#яздесь"
+CHALLENGE_RE = re.compile(r'(?<!\w)#\s*яздесь(?!\w)', re.IGNORECASE)
 
 # =========================
 #      BOT + DISPATCHER
@@ -133,14 +132,10 @@ def can_tag_today(chat_id: int, user_id: int) -> bool:
 #      HELPERS / UI
 # =========================
 async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    """
-    Отправляет ответ бота и удаляет его через delay секунд.
-    ВНИМАНИЕ: не используем message.reply() — чтобы не зависеть от aiogram context!
-    """
     sent = await bot.send_message(
         chat_id=message.chat.id,
         text=text,
-        reply_to_message_id=message.message_id  # визуально как reply
+        reply_to_message_id=message.message_id
     )
     async def _autodel():
         await asyncio.sleep(delay)
@@ -151,7 +146,6 @@ async def reply_autodel(message: types.Message, text: str, delay: int = 5):
     asyncio.create_task(_autodel())
 
 async def delete_user_command(message: types.Message):
-    """Удаляем САМО сообщение пользователя с командой (нужны права «Удалять сообщения»)."""
     try:
         await bot.delete_message(message.chat.id, message.message_id)
     except Exception:
@@ -161,7 +155,6 @@ def in_group(message: types.Message) -> bool:
     return message.chat and message.chat.type in ("group", "supergroup")
 
 def is_anonymous_admin(msg: types.Message) -> bool:
-    # Сообщение «от имени чата»: from_user — бот GroupAnonymousBot, sender_chat — группа/супергруппа
     return (
         msg.from_user is not None
         and msg.from_user.is_bot
@@ -195,11 +188,11 @@ async def cmd_start(message: types.Message):
     text = (
         "👋 Привет! Я считаю баллы по хэштегам в чате.\n\n"
         "📌 Как это работает:\n"
-        "• Напишите <b>#челлендж1</b> — получите <b>+5</b> баллов.\n"
+        f"• Напишите <b>{CHALLENGE_TAG}</b> — получите <b>+5</b> баллов.\n"
         "  Бот ответит «Поздравляю…» и удалит СВОЙ ответ через 5 секунд. Ваше сообщение остаётся.\n\n"
         "⏳ Лимит: не более <b>1 хэштега в день</b> на человека.\n\n"
         "🔧 Команды (в чате):\n"
-        "• /баланс — ваш личный счёт (ответ и ваш запрос удаляются через 5 сек)\n"
+        "• /баланс — ваш личный счёт (удаляется через 5 сек)\n"
         "• /top — топ-10 участников чата (удаляется через 5 сек)\n"
         "• /all — суммарный счёт всех участников (удаляется через 5 сек)\n"
     )
@@ -218,7 +211,7 @@ async def cmd_balance(message: types.Message):
 async def cmd_top(message: types.Message):
     rows = get_top(message.chat.id, limit=10)
     if not rows:
-        await reply_autodel(message, "📭 Пока пусто. Начните с <b>#челлендж1</b>!")
+        await reply_autodel(message, f"📭 Пока пусто. Начните с <b>{CHALLENGE_TAG}</b>!")
         if in_group(message):
             await delete_user_command(message)
         return
@@ -247,8 +240,8 @@ async def on_text(message: types.Message):
     if is_anonymous_admin(message):
         await reply_autodel(
             message,
-            "ℹ️ Сообщение отправлено от имени чата.\n"
-            "Чтобы получить баллы, напишите хэштег <b>от своего имени</b>.",
+            f"ℹ️ Сообщение отправлено от имени чата.\n"
+            f"Чтобы получить баллы, напишите хэштег <b>{CHALLENGE_TAG}</b> от своего имени.",
             delay=5
         )
         return
@@ -258,13 +251,11 @@ async def on_text(message: types.Message):
     raw = message.text or ""
     cleaned = clean_text(raw)
     tags = set(extract_hashtags(message.text, message.entities))
-    logger.info("DEBUG(text) chat=%s type=%s cleaned=%r tags=%r",
-                message.chat.id, message.chat.type, cleaned, tags)
 
     is_challenge = (
         (CHALLENGE_TAG in tags) or
         bool(CHALLENGE_RE.search(cleaned)) or
-        ("челлендж1" in cleaned and "#" in cleaned)
+        ("яздесь" in cleaned and "#" in cleaned)
     )
     if not is_challenge:
         return
@@ -296,8 +287,8 @@ async def on_media(message: types.Message):
     if is_anonymous_admin(message):
         await reply_autodel(
             message,
-            "ℹ️ Сообщение отправлено от имени чата.\n"
-            "Чтобы получить баллы, прикрепите медиа и хэштег <b>от своего имени</b>.",
+            f"ℹ️ Сообщение отправлено от имени чата.\n"
+            f"Чтобы получить баллы, прикрепите медиа и хэштег <b>{CHALLENGE_TAG}</b> от своего имени.",
             delay=5
         )
         return
@@ -307,13 +298,11 @@ async def on_media(message: types.Message):
     caption = message.caption or ""
     cleaned = clean_text(caption)
     tags = set(extract_hashtags(message.caption, message.caption_entities))
-    logger.info("DEBUG(media) chat=%s type=%s cleaned=%r tags=%r",
-                message.chat.id, message.chat.type, cleaned, tags)
 
     is_challenge = (
         (CHALLENGE_TAG in tags) or
         bool(CHALLENGE_RE.search(cleaned)) or
-        ("челлендж1" in cleaned and "#" in cleaned)
+        ("яздесь" in cleaned and "#" in cleaned)
     )
     if not is_challenge:
         return
@@ -343,13 +332,10 @@ async def on_startup(app: web.Application):
     logger.info(f"🤖 Authorized as @{me.username} (id={me.id})")
 
 async def on_shutdown(app: web.Application):
-    # 1) снимаем вебхук (после него запроса к API больше не будет)
     try:
         await bot.delete_webhook()
     except Exception:
         pass
-
-    # 2) закрываем storage (если когда-нибудь добавишь FSM)
     try:
         storage = getattr(dp, "storage", None)
         if storage is not None:
@@ -357,18 +343,12 @@ async def on_shutdown(app: web.Application):
             await storage.wait_closed()
     except Exception:
         pass
-
-    # 3) корректно закрываем самого бота (внутри закроется ClientSession)
     try:
-        await bot.close()          # предпочтительнее, чем напрямую session.close()
+        await bot.close()
     except Exception:
         pass
-
-    # 4) даём event loop «тик», чтобы aiohttp успел закрыть коннекторы
     await asyncio.sleep(0)
-
     logger.info("👋 Shutdown complete")
-
 
 # =========================
 #  AIOHTTP APP & RAW WEBHOOK
@@ -378,7 +358,6 @@ async def webhook_handler(request: web.Request) -> web.Response:
         data = await request.json()
     except Exception:
         data = {}
-    logger.info("RAW JSON: %s", json.dumps(data, ensure_ascii=False))
     try:
         update = types.Update.to_object(data)
         await dp.process_update(update)

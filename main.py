@@ -1,385 +1,152 @@
-# -*- coding: utf-8 -*-
-import os
-import re
-import sqlite3
 import logging
+import os
 import asyncio
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.utils.executor import start_webhook
 
-# =========================
-#        CONFIG
-# =========================
+import gspread
+from google.oauth2.service_account import Credentials
+
+# --- НАСТРОЙКИ ---
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SHEET_NAME = "ЯЗДЕСЬ"
+
+WEBHOOK_HOST = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
+
+# --- ЛОГИ ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("❌ TELEGRAM_BOT_TOKEN is not set in environment!")
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-if not WEBHOOK_URL:
-    raise SystemExit("❌ WEBHOOK_URL is not set in environment! (e.g. https://<subdomain>.onrender.com/webhook)")
-
-PORT = int(os.getenv("PORT", "10000"))
-HOST = "0.0.0.0"
-
-DB_PATH = os.getenv("DB_PATH", "scores.db")
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))  # смещение для определения "сегодня"
-
-# Настройки правил
-CHALLENGE_TAG = "#яздесь"
-CHALLENGE_RE = re.compile(r'(?<!\w)#\s*яздесь(?!\w)', re.IGNORECASE)
-
-# =========================
-#      BOT + DISPATCHER
-# =========================
-bot = Bot(token=TOKEN, parse_mode="HTML")
+# --- BOT ---
+bot = Bot(token=API_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# =========================
-#         TIME
-# =========================
-def current_local_date() -> date:
-    tz = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-    return datetime.now(tz).date()
+# --- GOOGLE SHEETS ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+gc = gspread.authorize(creds)
+sheet = gc.open(SHEET_NAME).sheet1  # первая вкладка
 
-# =========================
-#        DATABASE
-# =========================
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS scores (
-            chat_id    INTEGER NOT NULL,
-            user_id    INTEGER NOT NULL,
-            points     INTEGER NOT NULL DEFAULT 0,
-            username   TEXT,
-            full_name  TEXT,
-            PRIMARY KEY (chat_id, user_id)
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS last_tag (
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            day     TEXT NOT NULL,
-            PRIMARY KEY (chat_id, user_id)
-        )
-        """)
-        conn.commit()
+# создаём заголовки, если пусто
+if not sheet.row_values(1):
+    sheet.append_row(["UserID", "Username", "Points", "LastDate"])
 
-def add_points(chat_id: int, user: types.User, amount: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        with conn:
-            conn.execute("""
-                INSERT INTO scores(chat_id, user_id, points, username, full_name)
-                VALUES (?, ?, 0, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO NOTHING
-            """, (chat_id, user.id, user.username or "", user.full_name))
-            conn.execute("""
-                UPDATE scores
-                SET points = points + ?, username = ?, full_name = ?
-                WHERE chat_id = ? AND user_id = ?
-            """, (amount, user.username or "", user.full_name, chat_id, user.id))
-            cur = conn.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user.id))
-            row = cur.fetchone()
-            return int(row[0]) if row else 0
 
-def get_points(chat_id: int, user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT points FROM scores WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
+# --- УТИЛИТЫ ---
+def get_user_row(user_id: int):
+    """ищет строку пользователя по user_id"""
+    records = sheet.get_all_records()
+    for i, r in enumerate(records, start=2):  # первая строка — заголовки
+        if str(r["UserID"]) == str(user_id):
+            return i, r
+    return None, None
 
-def get_top(chat_id: int, limit: int = 10):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("""
-            SELECT user_id, points, COALESCE(username,''), COALESCE(full_name,'Без имени')
-            FROM scores
-            WHERE chat_id=?
-            ORDER BY points DESC, user_id ASC
-            LIMIT ?
-        """, (chat_id, limit))
-        return cur.fetchall()
 
-def get_total(chat_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT SUM(points) FROM scores WHERE chat_id=?", (chat_id,))
-        row = cur.fetchone()
-        return int(row[0]) if row and row[0] else 0
+def update_points(user: types.User, add_points: int):
+    """обновляет баллы пользователя в таблице"""
+    today = datetime.utcnow().date()
 
-def can_tag_today(chat_id: int, user_id: int) -> bool:
-    """Лимит: 1 хэштег в день на человека (по чату)."""
-    today = current_local_date().isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT day FROM last_tag WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        row = cur.fetchone()
-        if row and row[0] == today:
-            return False
-        with conn:
-            conn.execute("""
-                INSERT INTO last_tag(chat_id, user_id, day)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET day=excluded.day
-            """, (chat_id, user_id, today))
-        return True
+    row, record = get_user_row(user.id)
+    if record:
+        last_date = record["LastDate"]
+        if str(last_date) == str(today):  # уже играл сегодня
+            return False, record["Points"]
+        new_points = record["Points"] + add_points
+        sheet.update_cell(row, 3, new_points)
+        sheet.update_cell(row, 4, str(today))
+        return True, new_points
+    else:
+        sheet.append_row([user.id, user.username or user.full_name, add_points, str(today)])
+        return True, add_points
 
-# =========================
-#      HELPERS / UI
-# =========================
-async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    sent = await bot.send_message(
-        chat_id=message.chat.id,
-        text=text,
-        reply_to_message_id=message.message_id
-    )
-    async def _autodel():
-        await asyncio.sleep(delay)
-        try:
-            await bot.delete_message(sent.chat.id, sent.message_id)
-        except Exception:
-            pass
-    asyncio.create_task(_autodel())
 
-async def delete_user_command(message: types.Message):
+def get_balance(user_id: int):
+    _, record = get_user_row(user_id)
+    return record["Points"] if record else 0
+
+
+def get_top(n=10):
+    records = sheet.get_all_records()
+    sorted_users = sorted(records, key=lambda x: x["Points"], reverse=True)
+    return sorted_users[:n]
+
+
+async def reply_autodel(message: Message, text: str, delay: int = 5):
+    sent = await message.reply(text)
+    await asyncio.sleep(delay)
     try:
-        await bot.delete_message(message.chat.id, message.message_id)
+        await sent.delete()
     except Exception:
         pass
 
-def in_group(message: types.Message) -> bool:
-    return message.chat and message.chat.type in ("group", "supergroup")
 
-def is_anonymous_admin(msg: types.Message) -> bool:
-    return (
-        msg.from_user is not None
-        and msg.from_user.is_bot
-        and msg.sender_chat is not None
-        and msg.sender_chat.type in ("group", "supergroup")
-    )
+# --- ХЭНДЛЕРЫ ---
 
-def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("\r", "").replace("\n", " ").strip()
-    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        s = s.replace(ch, "")
-    s = re.sub(r"#\s+", "#", s)
-    return s.lower()
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: Message):
+    await message.reply("👋 Привет! Пиши <b>#яздесь</b> один раз в день и получай +5 баллов!\n"
+                        "Посмотреть свой баланс: /баланс\n"
+                        "Топ участников: /топ")
 
-def extract_hashtags(text: str, entities):
-    if not text or not entities:
-        return []
-    tags = []
-    for ent in entities:
-        if ent.type == "hashtag":
-            tags.append(clean_text(text[ent.offset: ent.offset + ent.length]))
-    return tags
-
-# =========================
-#         COMMANDS
-# =========================
-@dp.message_handler(commands=["start", "help"])
-async def cmd_start(message: types.Message):
-    text = (
-        "👋 Привет! Я считаю баллы по хэштегам в чате.\n\n"
-        "📌 Как это работает:\n"
-        f"• Напишите <b>{CHALLENGE_TAG}</b> — получите <b>+5</b> баллов.\n"
-        "  Бот ответит «Поздравляю…» и удалит СВОЙ ответ через 5 секунд. Ваше сообщение остаётся.\n\n"
-        "⏳ Лимит: не более <b>1 хэштега в день</b> на человека.\n\n"
-        "🔧 Команды (в чате):\n"
-        "• /баланс — ваш личный счёт (удаляется через 5 сек)\n"
-        "• /top — топ-10 участников чата (удаляется через 5 сек)\n"
-        "• /all — суммарный счёт всех участников (удаляется через 5 сек)\n"
-    )
-    await reply_autodel(message, text)
-    if in_group(message):
-        await delete_user_command(message)
 
 @dp.message_handler(commands=["баланс"])
-async def cmd_balance(message: types.Message):
-    pts = get_points(message.chat.id, message.from_user.id)
-    await reply_autodel(message, f"💰 Ваш баланс: <b>{pts}</b> баллов", delay=5)
-    if in_group(message):
-        await delete_user_command(message)
+async def cmd_balance(message: Message):
+    balance = get_balance(message.from_user.id)
+    await reply_autodel(message, f"📊 Ваш баланс: <b>{balance}</b> баллов")
 
-@dp.message_handler(commands=["top", "топ"])
-async def cmd_top(message: types.Message):
-    rows = get_top(message.chat.id, limit=10)
-    if not rows:
-        await reply_autodel(message, f"📭 Пока пусто. Начните с <b>{CHALLENGE_TAG}</b>!")
-        if in_group(message):
-            await delete_user_command(message)
+
+@dp.message_handler(commands=["топ"])
+async def cmd_top(message: Message):
+    top_users = get_top()
+    if not top_users:
+        await message.reply("Пока нет участников.")
         return
-    lines = ["🏆 <b>Топ-10 этого чата</b>"]
-    for i, (user_id, pts, username, full_name) in enumerate(rows, start=1):
-        name = f"@{username}" if username else f'<a href="tg://user?id={user_id}">{full_name}</a>'
-        lines.append(f"{i}. {name} — <b>{pts}</b> баллов")
-    await reply_autodel(message, "\n".join(lines))
-    if in_group(message):
-        await delete_user_command(message)
+    text = "🏆 <b>ТОП участников</b>\n\n"
+    for i, user in enumerate(top_users, start=1):
+        name = user['Username'] or f"id{user['UserID']}"
+        text += f"{i}. {name} — {user['Points']} баллов\n"
+    await message.reply(text)
 
-@dp.message_handler(commands=["all", "общий"])
-async def cmd_all(message: types.Message):
-    total = get_total(message.chat.id)
-    await reply_autodel(message, f"🌍 Общий счёт всех участников: <b>{total}</b> баллов")
-    if in_group(message):
-        await delete_user_command(message)
 
-# =========================
-#     GROUP TEXT / MEDIA
-# =========================
-@dp.message_handler(content_types=types.ContentType.TEXT)
-async def on_text(message: types.Message):
-    if not in_group(message):
-        return
-    if is_anonymous_admin(message):
-        await reply_autodel(
-            message,
-            f"ℹ️ Сообщение отправлено от имени чата.\n"
-            f"Чтобы получить баллы, напишите хэштег <b>{CHALLENGE_TAG}</b> от своего имени.",
-            delay=5
-        )
-        return
-    if message.from_user and message.from_user.is_bot:
-        return
+@dp.message_handler(lambda m: m.text and "#яздесь" in m.text.lower())
+async def hashtag_handler(message: Message):
+    ok, points = update_points(message.from_user, 5)
+    if ok:
+        await reply_autodel(message,
+                            f"🎉 Поздравляю, {message.from_user.first_name}!\n"
+                            f"Вам начислено <b>+5</b> баллов.\n"
+                            f"Теперь у вас <b>{points}</b> 💎")
+    else:
+        await reply_autodel(message, "⏳ Сегодня вы уже отмечались! Приходите завтра 😉")
 
-    raw = message.text or ""
-    cleaned = clean_text(raw)
-    tags = set(extract_hashtags(message.text, message.entities))
 
-    is_challenge = (
-        (CHALLENGE_TAG in tags) or
-        bool(CHALLENGE_RE.search(cleaned)) or
-        ("яздесь" in cleaned and "#" in cleaned)
-    )
-    if not is_challenge:
-        return
+# --- WEBHOOK ---
+async def on_startup(dp):
+    await bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
 
-    if not can_tag_today(message.chat.id, message.from_user.id):
-        await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
-        return
 
-    new_total = add_points(message.chat.id, message.from_user, 5)
-    await reply_autodel(
-        message,
-        f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов!\n"
-        f"💰 Ваш баланс: <b>{new_total}</b>",
-        delay=5
-    )
-
-@dp.message_handler(content_types=[
-    types.ContentType.PHOTO,
-    types.ContentType.VIDEO,
-    types.ContentType.ANIMATION,
-    types.ContentType.DOCUMENT,
-    types.ContentType.AUDIO,
-    types.ContentType.VOICE,
-    types.ContentType.VIDEO_NOTE,
-])
-async def on_media(message: types.Message):
-    if not in_group(message):
-        return
-    if is_anonymous_admin(message):
-        await reply_autodel(
-            message,
-            f"ℹ️ Сообщение отправлено от имени чата.\n"
-            f"Чтобы получить баллы, прикрепите медиа и хэштег <b>{CHALLENGE_TAG}</b> от своего имени.",
-            delay=5
-        )
-        return
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    caption = message.caption or ""
-    cleaned = clean_text(caption)
-    tags = set(extract_hashtags(message.caption, message.caption_entities))
-
-    is_challenge = (
-        (CHALLENGE_TAG in tags) or
-        bool(CHALLENGE_RE.search(cleaned)) or
-        ("яздесь" in cleaned and "#" in cleaned)
-    )
-    if not is_challenge:
-        return
-
-    if not can_tag_today(message.chat.id, message.from_user.id):
-        await reply_autodel(message, "⏳ Сегодня вы уже использовали хэштег. Попробуйте завтра!")
-        return
-
-    new_total = add_points(message.chat.id, message.from_user, 5)
-    await reply_autodel(
-        message,
-        f"🎉 Поздравляю! Вам засчитано <b>+5</b> баллов!\n"
-        f"💰 Ваш баланс: <b>{new_total}</b>",
-        delay=5
-    )
-
-# =========================
-#  STARTUP / SHUTDOWN
-# =========================
-async def on_startup(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
-
-    init_db()
-    me = await bot.get_me()
-    logger.info(f"🤖 Authorized as @{me.username} (id={me.id})")
-
-async def on_shutdown(app: web.Application):
-    try:
-        await bot.delete_webhook()
-    except Exception:
-        pass
-    try:
-        storage = getattr(dp, "storage", None)
-        if storage is not None:
-            await storage.close()
-            await storage.wait_closed()
-    except Exception:
-        pass
-    try:
-        await bot.close()
-    except Exception:
-        pass
-    await asyncio.sleep(0)
+async def on_shutdown(dp):
     logger.info("👋 Shutdown complete")
+    await bot.delete_webhook()
+    await bot.session.close()
 
-# =========================
-#  AIOHTTP APP & RAW WEBHOOK
-# =========================
-async def webhook_handler(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    try:
-        update = types.Update.to_object(data)
-        await dp.process_update(update)
-    except Exception as e:
-        logger.exception("Failed to process update: %s", e)
-    return web.Response(text="ok")
-
-async def health(request: web.Request) -> web.Response:
-    return web.Response(text="OK")
-
-def create_app() -> web.Application:
-    from urllib.parse import urlparse
-    parsed = urlparse(WEBHOOK_URL)
-    webhook_path = parsed.path or "/webhook"
-
-    app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    app.router.add_get("/", health)
-    app.router.add_post(webhook_path, webhook_handler)
-    return app
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host=HOST, port=PORT)
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )

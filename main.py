@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -31,12 +32,12 @@ POINTS_PER_TAG = int(os.getenv("POINTS_PER_TAG", "5"))
 VALID_TAGS = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#яздесь,#челлендж1").split(",")}
 
 # Вебхук и сервер
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Можешь задать ЛЮБОЙ полный URL. Мы возьмём путь как есть.
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Полный URL, путь берем как есть
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
 # ================== GOOGLE SHEETS ==================
-# ТРЕБУЕШЬ DRIVE — ОК: добавляю drive.readonly
+# Просила с Drive — подключаю drive.readonly
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -57,7 +58,6 @@ try:
     if SPREADSHEET_ID:
         sh = gc.open_by_key(SPREADSHEET_ID)
     else:
-        # Открываем по имени — требует drive.readonly (что мы и включили)
         sh = gc.open(SHEET_NAME)
     sheet = sh.sheet1
 except Exception as e:
@@ -86,10 +86,21 @@ def today_str() -> str:
     tz = ZoneInfo(LOCAL_TZ)
     return datetime.now(tz).date().isoformat()
 
+def _safe_int(x) -> int:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return 0
+
 def get_user_points(user_id: int) -> int:
+    """Суммируем только числовые значения Points для данного user_id."""
     try:
         records = sheet.get_all_records(expected_headers=HEADERS, default_blank="")
-        return sum(int(r.get("Points") or 0) for r in records if str(r.get("User_id")) == str(user_id))
+        return sum(
+            _safe_int(r.get("Points"))
+            for r in records
+            if str(r.get("User_id")) == str(user_id)
+        )
     except Exception:
         logger.exception("Ошибка при суммировании баллов")
         return 0
@@ -120,22 +131,40 @@ def add_points(user: types.User, points: int):
     ]
     sheet.append_row(row)
 
+async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_id: int | None = None, delay: int = 5):
+    """Удаляем ответ бота через delay секунд и пробуем удалить сообщение пользователя (если возможно)."""
+    await asyncio.sleep(delay)
+    # удалить ответ бота — всегда можем
+    try:
+        await bot.delete_message(chat_id, bot_message_id)
+    except Exception:
+        pass
+    # удалить команду пользователя: получится только в группах при нужных правах
+    if user_message_id:
+        try:
+            await bot.delete_message(chat_id, user_message_id)
+        except Exception:
+            pass
+
 # ================== BOT (aiogram v2) ==================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# ВАЖНО: починим контекст, чтобы message.answer() работал
+# починим контекст, чтобы message.answer() работал стабильно
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
-    await message.reply("👋 Привет! Отмечайся хештегом #яздесь или #челлендж1. Команда: /баланс")
+    sent = await message.answer("👋 Привет! Отмечайся хештегом #яздесь или #челлендж1. Команда: /баланс, /итого")
+    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
-@dp.message_handler(commands=["баланс", "balance"])
+@dp.message_handler(commands=["баланс", "balance", "итого"])
 async def cmd_balance(message: types.Message):
     total = get_user_points(message.from_user.id)
-    await message.reply(f"Ваш баланс: {total} баллов")
+    sent = await message.answer(f"Ваш баланс: {total} баллов")
+    # удаляем и ответ, и команду через 5 сек
+    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
 @dp.message_handler(lambda m: bool(m.text))
 async def handle_text(message: types.Message):
@@ -143,29 +172,29 @@ async def handle_text(message: types.Message):
     if any(tag in text for tag in VALID_TAGS):
         user = message.from_user
         if already_checked_today(user.id):
-            await message.reply("⚠️ Сегодня вы уже отмечались, баллы не начислены.")
+            sent = await message.answer("⚠️ Сегодня вы уже отмечались, баллы не начислены.")
+            asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
             return
         try:
             add_points(user, POINTS_PER_TAG)
             total = get_user_points(user.id)
-            await message.answer("✅ Баллы начислены!")
-            await message.reply(f"Ваш баланс: {total} баллов")
+            sent1 = await message.answer("✅ Баллы начислены!")
+            sent2 = await message.answer(f"Ваш баланс: {total} баллов")
+            # удаляем ответы бота (сообщение пользователя — оставляем, это не команда)
+            asyncio.create_task(auto_delete(bot, message.chat.id, sent1.message_id))
+            asyncio.create_task(auto_delete(bot, message.chat.id, sent2.message_id))
         except Exception:
             logger.exception("Ошибка при начислении баллов")
-            await message.reply("❌ Не удалось записать баллы. Попробуйте позже.")
+            sent = await message.answer("❌ Не удалось записать баллы. Попробуйте позже.")
+            asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
+    # иначе молчим
 
 # ================== WEBHOOK / AIOHTTP ==================
 def _path_from_webhook_url(default_path="/webhook"):
-    """
-    Берём путь из WEBHOOK_URL как есть (если задан).
-    Если не задан — используем default_path.
-    Добавим дубли с/без завершающего слеша для надёжности.
-    """
     if WEBHOOK_URL:
         try:
             parsed = urlparse(WEBHOOK_URL)
-            path = parsed.path or "/"
-            return path
+            return parsed.path or "/"
         except Exception:
             logger.exception("Не удалось распарсить WEBHOOK_URL; используем дефолтный путь")
     return default_path
@@ -173,7 +202,6 @@ def _path_from_webhook_url(default_path="/webhook"):
 WEBHOOK_PATH = _path_from_webhook_url("/webhook")
 
 async def on_startup(app):
-    # мягкая установка вебхука — не валим процесс, если не получилось
     if WEBHOOK_URL:
         try:
             await bot.set_webhook(WEBHOOK_URL)
@@ -188,40 +216,25 @@ async def on_shutdown(app):
         await bot.delete_webhook()
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    await bot.session.close()
+    # корректно закрываем сессию
+    try:
+        session = await bot.get_session()
+        await session.close()
+    except Exception:
+        pass
     logger.info("👋 Shutdown complete")
 
 async def handle_webhook(request):
     try:
         data = await request.json()
         update = types.Update(**data)
-
-        # страховка контекста (на некоторых хостингах это помогает)
+        # страховка контекста
         Bot.set_current(bot)
         Dispatcher.set_current(dp)
-
         await dp.process_update(update)
         return web.Response(status=200)
     except Exception:
         logger.exception("Ошибка при обработке webhook")
         return web.Response(status=200)
 
-async def healthcheck(request):
-    return web.Response(text="ok")
-
-app = web.Application()
-# Health
-app.router.add_get("/", healthcheck)
-
-# Регистрируем роут ровно по твоему пути И дубликат с противоположным слешем на конце
-app.router.add_post(WEBHOOK_PATH, handle_webhook)
-if WEBHOOK_PATH.endswith("/"):
-    app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
-else:
-    app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
-
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
-
-if __name__ == "__main__":
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+async def healthcheck(request)

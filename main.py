@@ -1,168 +1,134 @@
-import logging
 import os
 import json
+import logging
 from datetime import datetime
-
 from aiohttp import web
+import gspread
+from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.executor import start_webhook
 
-import gspread
-from google.oauth2.service_account import Credentials
-
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 
-# -------------------
-# CONFIG
-# -------------------
+# Конфиги
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан!")
-
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
-if not WEBHOOK_BASE:
-    raise RuntimeError("WEBHOOK_URL или RENDER_EXTERNAL_URL не задан")
-
-WEBHOOK_URL = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH + "/"
-
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", "10000"))
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
 SHEET_NAME = "challenge-points"
 
-# -------------------
-# GOOGLE SHEETS AUTH
-# -------------------
+# Google Sheets
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if not svc_json_env:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON не задан")
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
 
 try:
     service_account_info = json.loads(svc_json_env)
-except Exception:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON содержит некорректный JSON")
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-gc = gspread.authorize(creds)
-
-try:
-    sheet = gc.open(SHEET_NAME).sheet1
+    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 except Exception as e:
-    raise RuntimeError(f"Не удалось открыть таблицу {SHEET_NAME}: {e}")
+    raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
 
-# -------------------
-# BOT
-# -------------------
+gc = gspread.authorize(creds)
+sheet = gc.open(SHEET_NAME).sheet1
+
+HEADERS = ["User_id", "Username", "Name", "Points", "Date"]
+
+def ensure_headers(sheet):
+    try:
+        current = sheet.row_values(1)
+        if current[:len(HEADERS)] != HEADERS:
+            sheet.update('1:1', [HEADERS])
+            logger.info("Обновили заголовки в таблице")
+    except Exception as e:
+        logger.exception(f"Не удалось проверить/обновить заголовки: {e}")
+
+ensure_headers(sheet)
+
+# Bot
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://example.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
-def user_today_key(user_id: int):
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    return f"{user_id}:{today}"
+POINTS_PER_TAG = 5
+VALID_TAGS = {"#яздесь", "#челлендж1"}
 
+def get_today():
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
-def add_points(user_id: int, username: str, points: int = 5):
-    """Начисляем очки в таблицу"""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    values = sheet.get_all_records()
+# --- Логика работы с таблицей ---
+def get_user_points(user_id):
+    records = sheet.get_all_records(expected_headers=HEADERS, default_blank="")
+    total = 0
+    for r in records:
+        if str(r["User_id"]) == str(user_id):
+            total += int(r["Points"])
+    return total
 
-    # ищем пользователя
-    found_row = None
-    for idx, row in enumerate(values, start=2):  # начиная со второй строки
-        if str(row.get("user_id")) == str(user_id):
-            found_row = idx
-            break
+def already_checked_today(user_id):
+    today = get_today()
+    records = sheet.get_all_records(expected_headers=HEADERS, default_blank="")
+    for r in records:
+        if str(r["User_id"]) == str(user_id) and str(r["Date"]) == today:
+            return True
+    return False
 
-    if found_row:
-        current_points = int(sheet.cell(found_row, 3).value or 0)
-        sheet.update_cell(found_row, 2, username)
-        sheet.update_cell(found_row, 3, current_points + points)
-        sheet.update_cell(found_row, 4, today)
-    else:
-        sheet.append_row([str(user_id), username, points, today])
+def add_points(user: types.User, points):
+    today = get_today()
+    name = " ".join(filter(None, [user.first_name, user.last_name])) or ""
+    row = [user.id, user.username or "", name, points, today]
+    sheet.append_row(row)
 
-
-def get_balance(user_id: int) -> int:
-    values = sheet.get_all_records()
-    for row in values:
-        if str(row.get("user_id")) == str(user_id):
-            return int(row.get("points", 0))
-    return 0
-
+# --- Handlers ---
+@dp.message_handler(commands=["start", "help"])
+async def cmd_start(message: types.Message):
+    await message.reply("👋 Привет! Используй хештег #яздесь или команду /баланс.")
 
 @dp.message_handler(commands=["баланс"])
-async def balance_cmd(message: types.Message):
-    balance = get_balance(message.from_user.id)
-    await message.answer(f"Ваш баланс: {balance} баллов")
+async def cmd_balance(message: types.Message):
+    total = get_user_points(message.from_user.id)
+    await message.reply(f"Ваш баланс: {total} баллов")
 
-
-@dp.message_handler(lambda msg: msg.text and "#яздесь" in msg.text.lower())
+@dp.message_handler(lambda m: m.text and any(tag in m.text for tag in VALID_TAGS))
 async def handle_hashtag(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.full_name
-    key = user_today_key(user_id)
+    user = message.from_user
+    if already_checked_today(user.id):
+        await message.reply("⚠️ Сегодня вы уже отмечались, баллы не начислены.")
+        return
+    add_points(user, POINTS_PER_TAG)
+    total = get_user_points(user.id)
+    await message.reply(f"✅ Баллы начислены! Ваш баланс: {total}")
 
-    # Проверка на повтор
-    values = sheet.get_all_records()
-    for row in values:
-        if str(row.get("user_id")) == str(user_id) and row.get("last_date") == datetime.utcnow().strftime("%Y-%m-%d"):
-            await message.answer("Сегодня вы уже отмечались. Баллы не начислены.")
-            return
-
-    add_points(user_id, username, points=5)
-    await message.answer("✅ Баллы начислены!")
-
-
-# -------------------
-# AIOHTTP WEBHOOK APP
-# -------------------
-app = web.Application()
-
-
-async def handle_webhook(request: web.Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(text="bad json", status=400)
-    update = types.Update.to_object(data)
-    await dp.process_update(update)
-    return web.Response(text="ok")
-
-
-async def health(request: web.Request):
-    return web.json_response({"ok": True})
-
-
-# маршруты
-app.router.add_post(WEBHOOK_PATH, handle_webhook)
-app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
-app.router.add_get("/", health)
-
-
-async def on_startup(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=False)
+# --- Webhook ---
+async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
-    logger.info("✅ Webhook set to: %s", WEBHOOK_URL)
+    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
 
-
-async def on_shutdown(app: web.Application):
+async def on_shutdown(app):
+    await bot.delete_webhook()
     await bot.session.close()
     logger.info("👋 Shutdown complete")
 
+async def handle_webhook(request):
+    try:
+        data = await request.json()
+        update = types.Update.to_object(data)
+        await dp.process_update(update)
+    except Exception as e:
+        logger.exception(f"Ошибка при обработке webhook: {e}")
+    return web.Response()
 
+app = web.Application()
+app.router.add_post(WEBHOOK_PATH, handle_webhook)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
-# -------------------
-# ENTRY
-# -------------------
 if __name__ == "__main__":
     web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)

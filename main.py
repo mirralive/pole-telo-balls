@@ -3,42 +3,45 @@ import json
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 
 from aiohttp import web
 import gspread
 from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, types
 
-# ---------- Логирование ----------
+# ================== ЛОГИ ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 
-# ---------- Конфиги ----------
+# ================== КОНФИГ ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
+# Google Sheets
+SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")  # можно не задавать, если открываем по имени
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "challenge-points")
 
-# Таймзона для "сегодня"
+# Таймзона для «сегодня»
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Amsterdam")
 
-# URL хоста (Render подставляет RENDER_EXTERNAL_URL)
-# --- Webhook config ---
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ЯВНО задаём полную ссылку, если хотим
-WEBHOOK_PATH = "/webhook"               # роут остаётся
+# Баллы/теги
+POINTS_PER_TAG = int(os.getenv("POINTS_PER_TAG", "5"))
+VALID_TAGS = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#яздесь,#челлендж1").split(",")}
+
+# Вебхук и сервер
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Можешь задать ЛЮБОЙ полный URL. Мы возьмём путь как есть.
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
-POINTS_PER_TAG = int(os.getenv("POINTS_PER_TAG", "5"))
-# Поддержим несколько хештегов, регистр игнорируем
-VALID_TAGS = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#яздесь,#челлендж1").split(",")}
-
-# ---------- Google Sheets ----------
+# ================== GOOGLE SHEETS ==================
+# ТРЕБУЕШЬ DRIVE — ОК: добавляю drive.readonly
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
+
 svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if not svc_json_env:
     raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
@@ -51,14 +54,18 @@ except Exception as e:
 
 gc = gspread.authorize(creds)
 try:
-    sheet = gc.open(SHEET_NAME).sheet1
+    if SPREADSHEET_ID:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    else:
+        # Открываем по имени — требует drive.readonly (что мы и включили)
+        sh = gc.open(SHEET_NAME)
+    sheet = sh.sheet1
 except Exception as e:
-    raise RuntimeError(f"Cannot open sheet '{SHEET_NAME}': {e}")
+    raise RuntimeError(f"Cannot open sheet (id='{SPREADSHEET_ID}' name='{SHEET_NAME}'): {e}")
 
 HEADERS = ["User_id", "Username", "Name", "Points", "Date"]
 
 def ensure_headers():
-    """Гарантируем наличие нужной первой строки с заголовками."""
     try:
         values = sheet.get_all_values()
         if not values:
@@ -74,7 +81,7 @@ def ensure_headers():
 
 ensure_headers()
 
-# ---------- Вспомогательные ----------
+# ================== ВСПОМОГАТЕЛЬНЫЕ ==================
 def today_str() -> str:
     tz = ZoneInfo(LOCAL_TZ)
     return datetime.now(tz).date().isoformat()
@@ -101,8 +108,7 @@ def already_checked_today(user_id: int) -> bool:
 
 def human_name(u: types.User) -> str:
     parts = [u.first_name or "", u.last_name or ""]
-    name = " ".join(p for p in parts if p).strip()
-    return name
+    return " ".join(p for p in parts if p).strip()
 
 def add_points(user: types.User, points: int):
     row = [
@@ -112,11 +118,15 @@ def add_points(user: types.User, points: int):
         int(points),
         today_str(),
     ]
-    sheet.append_row(row)  # RAW достаточно
+    sheet.append_row(row)
 
-# ---------- Bot ----------
+# ================== BOT (aiogram v2) ==================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+
+# ВАЖНО: починим контекст, чтобы message.answer() работал
+Bot.set_current(bot)
+Dispatcher.set_current(dp)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
@@ -138,15 +148,32 @@ async def handle_text(message: types.Message):
         try:
             add_points(user, POINTS_PER_TAG)
             total = get_user_points(user.id)
-            await message.reply(f"✅ Баллы начислены! Ваш баланс: {total}")
+            await message.answer("✅ Баллы начислены!")
+            await message.reply(f"Ваш баланс: {total} баллов")
         except Exception:
             logger.exception("Ошибка при начислении баллов")
             await message.reply("❌ Не удалось записать баллы. Попробуйте позже.")
-    # иначе — молчим, бот реагирует только на хештеги и команды
 
-# ---------- Webhook ----------
+# ================== WEBHOOK / AIOHTTP ==================
+def _path_from_webhook_url(default_path="/webhook"):
+    """
+    Берём путь из WEBHOOK_URL как есть (если задан).
+    Если не задан — используем default_path.
+    Добавим дубли с/без завершающего слеша для надёжности.
+    """
+    if WEBHOOK_URL:
+        try:
+            parsed = urlparse(WEBHOOK_URL)
+            path = parsed.path or "/"
+            return path
+        except Exception:
+            logger.exception("Не удалось распарсить WEBHOOK_URL; используем дефолтный путь")
+    return default_path
+
+WEBHOOK_PATH = _path_from_webhook_url("/webhook")
 
 async def on_startup(app):
+    # мягкая установка вебхука — не валим процесс, если не получилось
     if WEBHOOK_URL:
         try:
             await bot.set_webhook(WEBHOOK_URL)
@@ -154,7 +181,7 @@ async def on_startup(app):
         except Exception:
             logger.exception("Не удалось установить webhook — продолжаем без него")
     else:
-        logger.warning("WEBHOOK_URL не задан — запускаемся без установки вебхука")
+        logger.warning("WEBHOOK_URL не задан — сервер поднимется, но Telegram не будет знать куда слать апдейты.")
 
 async def on_shutdown(app):
     try:
@@ -164,13 +191,37 @@ async def on_shutdown(app):
     await bot.session.close()
     logger.info("👋 Shutdown complete")
 
-
 async def handle_webhook(request):
     try:
         data = await request.json()
-        update = types.Update(**data)  # ВАЖНО: корректно создать Update для aiogram v2
+        update = types.Update(**data)
+
+        # страховка контекста (на некоторых хостингах это помогает)
+        Bot.set_current(bot)
+        Dispatcher.set_current(dp)
+
         await dp.process_update(update)
         return web.Response(status=200)
     except Exception:
         logger.exception("Ошибка при обработке webhook")
-        return we
+        return web.Response(status=200)
+
+async def healthcheck(request):
+    return web.Response(text="ok")
+
+app = web.Application()
+# Health
+app.router.add_get("/", healthcheck)
+
+# Регистрируем роут ровно по твоему пути И дубликат с противоположным слешем на конце
+app.router.add_post(WEBHOOK_PATH, handle_webhook)
+if WEBHOOK_PATH.endswith("/"):
+    app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
+else:
+    app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
+
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
+
+if __name__ == "__main__":
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)

@@ -37,7 +37,6 @@ WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
 # ================== GOOGLE SHEETS ==================
-# Просила с Drive — подключаю drive.readonly
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -92,34 +91,33 @@ def _safe_int(x) -> int:
     except Exception:
         return 0
 
-def get_user_points(user_id: int) -> int:
-    """Суммируем только числовые значения Points для данного user_id."""
+def read_records():
     try:
-        records = sheet.get_all_records(expected_headers=HEADERS, default_blank="")
-        return sum(
-            _safe_int(r.get("Points"))
-            for r in records
-            if str(r.get("User_id")) == str(user_id)
-        )
+        return sheet.get_all_records(expected_headers=HEADERS, default_blank="")
     except Exception:
-        logger.exception("Ошибка при суммировании баллов")
-        return 0
+        logger.exception("Не удалось прочитать таблицу")
+        return []
+
+def get_user_points(user_id: int) -> int:
+    records = read_records()
+    return sum(
+        _safe_int(r.get("Points"))
+        for r in records
+        if str(r.get("User_id")) == str(user_id)
+    )
 
 def already_checked_today(user_id: int) -> bool:
-    try:
-        today = today_str()
-        records = sheet.get_all_records(expected_headers=HEADERS, default_blank="")
-        for r in records:
-            if str(r.get("User_id")) == str(user_id) and str(r.get("Date")) == today:
-                return True
-        return False
-    except Exception:
-        logger.exception("Ошибка при проверке отметки за сегодня")
-        return False
+    records = read_records()
+    today = today_str()
+    for r in records:
+        if str(r.get("User_id")) == str(user_id) and str(r.get("Date")) == today:
+            return True
+    return False
 
 def human_name(u: types.User) -> str:
     parts = [u.first_name or "", u.last_name or ""]
-    return " ".join(p for p in parts if p).strip()
+    name = " ".join(p for p in parts if p).strip()
+    return name or (("@" + u.username) if u.username else str(u.id))
 
 def add_points(user: types.User, points: int):
     row = [
@@ -131,15 +129,50 @@ def add_points(user: types.User, points: int):
     ]
     sheet.append_row(row)
 
+def get_leaderboard(top_n: int = 10, today_only: bool = False):
+    """Возвращает список кортежей (total, name, username, user_id)."""
+    records = read_records()
+    totals = {}  # user_id -> total
+    names = {}   # user_id -> display name (последняя известная)
+    usernames = {}
+
+    today = today_str()
+    for r in records:
+        if today_only and str(r.get("Date")) != today:
+            continue
+        uid = str(r.get("User_id"))
+        pts = _safe_int(r.get("Points"))
+        totals[uid] = totals.get(uid, 0) + pts
+        nm = str(r.get("Name") or "").strip()
+        un = str(r.get("Username") or "").strip()
+        if nm:
+            names[uid] = nm
+        if un:
+            usernames[uid] = un
+
+    items = []
+    for uid, total in totals.items():
+        name = names.get(uid) or (("@" + usernames[uid]) if usernames.get(uid) else uid)
+        items.append((total, name, usernames.get(uid, ""), uid))
+
+    items.sort(key=lambda x: (-x[0], x[1].lower()))
+    return items[:top_n]
+
+def format_leaderboard(items, title="🏆 Топ-10"):
+    if not items:
+        return f"{title}\nПока нет данных."
+    lines = [title]
+    for idx, (total, name, username, uid) in enumerate(items, start=1):
+        handle = f" (@{username})" if username else ""
+        lines.append(f"{idx}. {name}{handle} — {total}")
+    return "\n".join(lines)
+
 async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_id: int | None = None, delay: int = 5):
-    """Удаляем ответ бота через delay секунд и пробуем удалить сообщение пользователя (если возможно)."""
     await asyncio.sleep(delay)
-    # удалить ответ бота — всегда можем
     try:
         await bot.delete_message(chat_id, bot_message_id)
     except Exception:
         pass
-    # удалить команду пользователя: получится только в группах при нужных правах
     if user_message_id:
         try:
             await bot.delete_message(chat_id, user_message_id)
@@ -149,21 +182,32 @@ async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_
 # ================== BOT (aiogram v2) ==================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-
-# починим контекст, чтобы message.answer() работал стабильно
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
-    sent = await message.answer("👋 Привет! Отмечайся хештегом #яздесь или #челлендж1. Команда: /баланс, /итого")
+    sent = await message.answer("👋 Привет! Отмечайся хештегом #яздесь или #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня")
     asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
 @dp.message_handler(commands=["баланс", "balance", "итого"])
 async def cmd_balance(message: types.Message):
     total = get_user_points(message.from_user.id)
     sent = await message.answer(f"Ваш баланс: {total} баллов")
-    # удаляем и ответ, и команду через 5 сек
+    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
+
+@dp.message_handler(commands=["итоги", "leaders", "топ", "top"])
+async def cmd_leaders(message: types.Message):
+    items = get_leaderboard(top_n=10, today_only=False)
+    text = format_leaderboard(items, title="🏆 Итоги (всего), топ-10")
+    sent = await message.answer(text)
+    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
+
+@dp.message_handler(commands=["итоги_сегодня", "leaders_today", "топ_сегодня", "top_today"])
+async def cmd_leaders_today(message: types.Message):
+    items = get_leaderboard(top_n=10, today_only=True)
+    text = format_leaderboard(items, title=f"🌞 Итоги за {today_str()}, топ-10")
+    sent = await message.answer(text)
     asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
 @dp.message_handler(lambda m: bool(m.text))
@@ -180,7 +224,6 @@ async def handle_text(message: types.Message):
             total = get_user_points(user.id)
             sent1 = await message.answer("✅ Баллы начислены!")
             sent2 = await message.answer(f"Ваш баланс: {total} баллов")
-            # удаляем ответы бота (сообщение пользователя — оставляем, это не команда)
             asyncio.create_task(auto_delete(bot, message.chat.id, sent1.message_id))
             asyncio.create_task(auto_delete(bot, message.chat.id, sent2.message_id))
         except Exception:
@@ -216,7 +259,6 @@ async def on_shutdown(app):
         await bot.delete_webhook()
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    # корректно закрываем HTTP-сессию бота без deprecated-метода
     try:
         session = await bot.get_session()
         await session.close()
@@ -228,7 +270,6 @@ async def handle_webhook(request):
     try:
         data = await request.json()
         update = types.Update(**data)
-        # страховка контекста
         Bot.set_current(bot)
         Dispatcher.set_current(dp)
         await dp.process_update(update)
@@ -242,14 +283,11 @@ async def healthcheck(request):
 
 app = web.Application()
 app.router.add_get("/", healthcheck)
-
-# Регистрируем ровно твой путь + дубль с/без завершающего слеша
 app.router.add_post(WEBHOOK_PATH, handle_webhook)
 if WEBHOOK_PATH.endswith("/"):
     app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
 else:
     app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
-
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 

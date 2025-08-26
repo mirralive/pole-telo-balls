@@ -237,4 +237,21 @@ async def handle_webhook(request):
         logger.exception("Ошибка при обработке webhook")
         return web.Response(status=200)
 
-async def healthcheck(request)
+async def healthcheck(request):
+    return web.Response(text="ok")
+
+app = web.Application()
+app.router.add_get("/", healthcheck)
+
+# Регистрируем ровно твой путь + дубль с/без завершающего слеша
+app.router.add_post(WEBHOOK_PATH, handle_webhook)
+if WEBHOOK_PATH.endswith("/"):
+    app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
+else:
+    app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
+
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
+
+if __name__ == "__main__":
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)

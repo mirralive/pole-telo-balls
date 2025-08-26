@@ -1,158 +1,211 @@
-import logging
 import os
 import json
 import asyncio
-from datetime import datetime, timedelta
+import logging
+from datetime import date
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import start_webhook
-from google.oauth2.service_account import Credentials
 import gspread
+from google.oauth2.service_account import Credentials
 
-# --- Логирование ---
+
+# ---------- Логирование ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 
-# --- Конфигурация Telegram ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
-dp = Dispatcher(bot)
+# ---------- Настройки ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
-# --- Конфигурация Google Sheets ---
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
+WEBHOOK_HOST = os.getenv("WEBHOOK_URL")  # например, https://xxx.onrender.com
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-if not svc_json_env:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
-
-try:
-    data = json.loads(svc_json_env)
-except json.JSONDecodeError:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON содержит некорректный JSON")
-
-# фиксируем ключ (переводим \\n → \n)
-if "private_key" in data and "\\n" in data["private_key"]:
-    data["private_key"] = data["private_key"].replace("\\n", "\n")
-
-creds = Credentials.from_service_account_info(data, scopes=SCOPES)
-gc = gspread.authorize(creds)
+PORT = int(os.getenv("PORT", "10000"))
 
 SHEET_NAME = "challenge-points"
+CHALLENGE_POINTS = 5
+AUTO_DELETE_SECONDS = 5
+TAG_TEXT = "#яздесь"
+
+
+# ---------- Авторизация Google Sheets ----------
+svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not svc_json_env:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON не установлен")
+
+try:
+    service_account_info = json.loads(svc_json_env)
+except Exception as e:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON содержит некорректный JSON") from e
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+gc = gspread.authorize(creds)
+
 try:
     sheet = gc.open(SHEET_NAME).sheet1
 except Exception as e:
     raise RuntimeError(f"Не удалось открыть таблицу {SHEET_NAME}: {e}")
 
-# --- Настройки челленджа ---
-CHALLENGE_TAG = "#яздесь"
-POINTS_PER_DAY = 5
 
-# --- Вспомогательные функции работы с таблицей ---
-def get_or_create_user_row(user_id: int, username: str, full_name: str):
-    """Находит или создаёт строку для пользователя в таблице"""
-    try:
-        records = sheet.get_all_records()
-    except Exception as e:
-        logger.error(f"Ошибка чтения таблицы: {e}")
-        return None
+# ---------- Хранение данных в Google Sheets ----------
+# Структура листа: user_id | username | balance | last_checkin
 
-    for idx, row in enumerate(records, start=2):  # первая строка — заголовки
-        if str(row.get("user_id")) == str(user_id):
-            return idx
-
-    # создаём новую строку
-    sheet.append_row([str(user_id), username, full_name, 0, ""])  # баллы = 0, последняя дата пустая
-    return len(records) + 2
-
-def add_points(user_id: int, username: str, full_name: str):
-    row = get_or_create_user_row(user_id, username, full_name)
-    if not row:
-        return 0, False
-
-    current_date = datetime.utcnow().date().isoformat()
-    values = sheet.row_values(row)
-
-    try:
-        points = int(values[3]) if len(values) >= 4 else 0
-        last_date = values[4] if len(values) >= 5 else ""
-    except Exception:
-        points, last_date = 0, ""
-
-    if last_date == current_date:
-        return points, False  # уже получал сегодня
-
-    points += POINTS_PER_DAY
-    sheet.update_cell(row, 4, points)
-    sheet.update_cell(row, 5, current_date)
-    return points, True
-
-def get_points(user_id: int):
+def get_user_row(user_id: int):
     records = sheet.get_all_records()
-    for row in records:
-        if str(row.get("user_id")) == str(user_id):
-            return int(row.get("points", 0))
+    for idx, row in enumerate(records, start=2):  # строка 1 — заголовки
+        if str(row["user_id"]) == str(user_id):
+            return idx, row
+    return None, None
+
+def get_balance(user_id: int) -> int:
+    _, row = get_user_row(user_id)
+    if row:
+        return int(row.get("balance", 0))
     return 0
 
-# --- Вспомогательная функция авто-удаления сообщений ---
-async def reply_autodel(message: types.Message, text: str, delay: int = 5):
-    sent = await message.reply(text)
-    await asyncio.sleep(delay)
-    try:
-        await sent.delete()
-    except Exception:
-        pass
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-# --- Хэндлеры ---
-@dp.message_handler(lambda m: m.text and m.text.startswith(CHALLENGE_TAG))
-async def handle_challenge(message: types.Message):
-    user = message.from_user
-    points, added = add_points(user.id, user.username or "", f"{user.first_name or ''} {user.last_name or ''}".strip())
-
-    if added:
-        text = f"🎉 {user.first_name}, вы получили <b>+{POINTS_PER_DAY} баллов</b>!\n✨ Ваш текущий счёт: <b>{points}</b>"
+def set_balance(user_id: int, username: str, balance: int):
+    row_idx, row = get_user_row(user_id)
+    if row_idx:
+        sheet.update_cell(row_idx, 3, balance)  # столбец "balance"
+        sheet.update_cell(row_idx, 2, username)  # обновляем username
     else:
-        text = f"⚡ {user.first_name}, вы уже отмечались сегодня!\nВаш счёт: <b>{points}</b>"
+        sheet.append_row([str(user_id), username, balance, ""])
 
-    await reply_autodel(message, text, delay=5)
+def get_last_checkin_date(user_id: int):
+    _, row = get_user_row(user_id)
+    if row:
+        return row.get("last_checkin") or None
+    return None
 
-@dp.message_handler(commands=["balance"])
+def set_last_checkin_date(user_id: int, iso_date: str):
+    row_idx, row = get_user_row(user_id)
+    if row_idx:
+        sheet.update_cell(row_idx, 4, iso_date)
+    else:
+        sheet.append_row([str(user_id), "", 0, iso_date])
+
+
+# ---------- Хелперы ----------
+async def delete_message_later(bot, chat_id: int, message_id: int, delay: int = AUTO_DELETE_SECONDS):
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_message(chat_id, message_id)
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
+
+async def reply_autodel(message, text: str, parse_mode="HTML", delay: int = AUTO_DELETE_SECONDS):
+    sent = await message.reply(text, parse_mode=parse_mode, disable_web_page_preview=True)
+    asyncio.create_task(delete_message_later(message.bot, message.chat.id, sent.message_id, delay))
+
+def today_iso() -> str:
+    return date.today().isoformat()
+
+def has_here_tag(message: types.Message) -> bool:
+    if not message.text:
+        return False
+    txt = message.text.strip()
+
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "hashtag":
+                tag = txt[ent.offset: ent.offset + ent.length]
+                if tag.casefold() == TAG_TEXT.casefold():
+                    return True
+
+    if TAG_TEXT.casefold() in txt.casefold().split():
+        return True
+
+    return False
+
+
+# ---------- Bot ----------
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot)
+
+
+@dp.message_handler(commands=["balance", "баланс"])
+@dp.message_handler(lambda m: m.text and m.text.strip().lower() in ("баланс", "#баланс"))
 async def cmd_balance(message: types.Message):
-    user = message.from_user
-    points = get_points(user.id)
-    text = f"📊 {user.first_name}, у вас <b>{points}</b> баллов"
-    await reply_autodel(message, text, delay=5)
+    bal = get_balance(message.from_user.id)
+    await reply_autodel(message, f"💰 Ваш баланс: <b>{bal}</b> баллов.")
 
-# --- Webhook конфигурация ---
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", "10000"))
 
-async def on_startup(dp):
+@dp.message_handler(commands=["top", "топ"])
+async def cmd_top(message: types.Message):
+    records = sheet.get_all_records()
+    # сортировка по баллам
+    sorted_records = sorted(records, key=lambda r: int(r.get("balance", 0)), reverse=True)
+    top5 = sorted_records[:5]
+
+    if not top5:
+        await reply_autodel(message, "Пока что таблица пуста.")
+        return
+
+    lines = ["🏆 <b>Топ участников</b>:"]
+    for idx, row in enumerate(top5, start=1):
+        uname = row.get("username") or "Без имени"
+        bal = row.get("balance", 0)
+        lines.append(f"{idx}. {uname} — <b>{bal}</b>")
+
+    await reply_autodel(message, "\n".join(lines))
+
+
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def on_text(message: types.Message):
+    txt = message.text.strip()
+
+    # Хештег #яздесь
+    if has_here_tag(message):
+        user_id = message.from_user.id
+        username = message.from_user.username or f"{message.from_user.first_name}"
+
+        last_iso = get_last_checkin_date(user_id)
+        if last_iso == today_iso():
+            await reply_autodel(message, "🙌 Вы уже отмечались сегодня. Увидимся завтра!")
+            return
+
+        current = get_balance(user_id)
+        new_balance = current + CHALLENGE_POINTS
+        set_balance(user_id, username, new_balance)
+        set_last_checkin_date(user_id, today_iso())
+
+        await reply_autodel(
+            message,
+            f"🎉 Поздравляю! +{CHALLENGE_POINTS} баллов. Теперь у вас: <b>{new_balance}</b> 🌟"
+        )
+        return
+
+
+# ---------- Webhook ----------
+async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Webhook установлен: {WEBHOOK_URL}")
 
-async def on_shutdown(dp):
+async def on_shutdown(app):
+    await bot.delete_webhook()
     logger.info("👋 Shutdown complete")
 
+async def handle_webhook(request):
+    data = await request.json()
+    update = types.Update.to_object(data)
+    await dp.process_update(update)
+    return web.Response()
+
+app = web.Application()
+app.router.add_post(WEBHOOK_PATH, handle_webhook)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
+
+
+# ---------- Запуск ----------
 if __name__ == "__main__":
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True,
-        host=WEBAPP_HOST,
-        port=WEBAPP_PORT,
-    )
+    web.run_app(app, host="0.0.0.0", port=PORT)

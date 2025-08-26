@@ -216,7 +216,7 @@ async def on_shutdown(app):
         await bot.delete_webhook()
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    # корректно закрываем сессию
+    # корректно закрываем HTTP-сессию бота без deprecated-метода
     try:
         session = await bot.get_session()
         await session.close()

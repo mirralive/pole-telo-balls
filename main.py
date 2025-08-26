@@ -364,7 +364,7 @@ else:
     app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
 # ручной ребайнд вебхука
 app.router.add_get("/set-webhook", set_webhook)
-
+app.router.add_post("/", handle_webhook)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 

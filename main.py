@@ -13,12 +13,12 @@ from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.types.message_entity import MessageEntityType
 
-# ================== ЛОГИ ==================
+# ============== ЛОГИ ==============
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
-# ================== КОНФИГ ==================
+# ============== КОНФИГ ==============
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -34,7 +34,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # может быть корень '/'
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
-# ================== GOOGLE SHEETS ==================
+# ============== GOOGLE SHEETS ==============
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -78,7 +78,7 @@ def ensure_headers_sync():
 
 ensure_headers_sync()
 
-# ====== Обёртки для Google Sheets в отдельном потоке ======
+# ====== Sheets в отдельном потоке ======
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -184,11 +184,10 @@ async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_
         except Exception:
             pass
 
-# ================== ХЕЛПЕРЫ ДЛЯ ТЕКСТА И ХЕШТЕГОВ ==================
+# ============== ХЭЛПЕРЫ: чат/юзер/хештеги ==============
 def extract_hashtags(msg: types.Message) -> list[str]:
-    """Извлекаем хештеги именно из entities, регистр игнорируем."""
     tags = []
-    if not msg.entities:
+    if not msg or not msg.entities:
         return tags
     text = msg.text or ""
     for e in msg.entities:
@@ -201,7 +200,6 @@ def is_valid_chat(message: types.Message) -> bool:
     return message.chat.type in ("private", "group", "supergroup")
 
 def is_valid_user(user: types.User | None) -> bool:
-    # отбрасываем анонимов/ботов/системного 777000
     if not user:
         return False
     if user.is_bot:
@@ -210,7 +208,7 @@ def is_valid_user(user: types.User | None) -> bool:
         return False
     return True
 
-# ================== BOT (aiogram v2) ==================
+# ============== BOT (aiogram v2) ==============
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 Bot.set_current(bot)
@@ -229,7 +227,7 @@ async def cmd_ping(message: types.Message):
 
 @dp.message_handler(commands=["debug"])
 async def cmd_debug(message: types.Message):
-    path = (urlparse(WEBHOOK_URL).path or "/") if WEBHOOK_URL else "/webhook"
+    path = (urlparse(WEBHOOK_URL).path or "/") if WEBHOOK_URL else "/"
     text = f"✅ Бот жив.\nWEBHOOK_PATH: {path}\nTZ: {LOCAL_TZ}"
     sent = await message.answer(text)
     asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
@@ -274,7 +272,6 @@ async def cmd_leaders_today(message: types.Message):
 @dp.message_handler(lambda m: isinstance(m.text, str) and m.text != "")
 async def handle_text(message: types.Message):
     try:
-        # фильтры на тип чата и валидного пользователя
         if not is_valid_chat(message):
             logger.info(f"[skip] chat_type={message.chat.type}")
             return
@@ -286,7 +283,6 @@ async def handle_text(message: types.Message):
         logger.info(f"[in] chat={message.chat.id} uid={message.from_user.id} tags={tags}")
         if not tags:
             return
-
         if not any(tag in VALID_TAGS for tag in tags):
             return
 
@@ -308,8 +304,8 @@ async def handle_text(message: types.Message):
         sent = await message.answer("⏳ Сервис временно недоступен. Попробуйте ещё раз.")
         asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
 
-# ================== WEBHOOK / AIOHTTP ==================
-def _path_from_webhook_url(default_path="/webhook"):
+# ============== WEBHOOK / AIOHTTP ==============
+def _path_from_webhook_url(default_path="/"):
     if WEBHOOK_URL:
         try:
             parsed = urlparse(WEBHOOK_URL)
@@ -345,6 +341,9 @@ async def on_shutdown(app):
 async def handle_webhook(request):
     try:
         data = await request.json()
+        # логируем тип апдейта (message, edited_message, channel_post и т.д.)
+        upd_keys = ", ".join(data.keys())
+        logger.info(f"[update] keys: {upd_keys}")
         update = types.Update(**data)
         Bot.set_current(bot)
         Dispatcher.set_current(dp)
@@ -357,13 +356,28 @@ async def handle_webhook(request):
 async def healthcheck(request):
     return web.Response(text="ok")
 
+async def set_webhook(request):
+    """Ручная установка вебхука на WEBHOOK_URL из env."""
+    if not WEBHOOK_URL:
+        return web.Response(text="WEBHOOK_URL env is empty", status=400)
+    try:
+        await bot.set_webhook(WEBHOOK_URL)
+        return web.Response(text=f"Webhook set: ok\n{WEBHOOK_URL}")
+    except Exception as e:
+        logger.exception("set_webhook failed")
+        return web.Response(text=f"Webhook set: failed\n{e}", status=500)
+
 app = web.Application()
 app.router.add_get("/", healthcheck)
 app.router.add_post(WEBHOOK_PATH, handle_webhook)
+# зеркальный маршрут с/без слеша
 if WEBHOOK_PATH.endswith("/"):
     app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
 else:
     app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
+# ручной ребайнд вебхука
+app.router.add_get("/set-webhook", set_webhook)
+
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 

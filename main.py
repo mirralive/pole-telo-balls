@@ -21,7 +21,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_URL")  # например, https://xxx.onrender.com
-WEBHOOK_PATH = "/webhook/webhook"
+WEBHOOK_PATH = "/"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 PORT = int(os.getenv("PORT", "10000"))

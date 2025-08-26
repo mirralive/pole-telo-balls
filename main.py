@@ -11,6 +11,7 @@ from aiohttp import web
 import gspread
 from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, types
+from aiogram.types.message_entity import MessageEntityType
 
 # ================== ЛОГИ ==================
 logging.basicConfig(level=logging.INFO)
@@ -75,7 +76,6 @@ def ensure_headers_sync():
     except Exception:
         logger.exception("Не удалось проверить/обновить заголовки")
 
-# Выполним синхронно один раз при старте
 ensure_headers_sync()
 
 # ====== Обёртки для Google Sheets в отдельном потоке ======
@@ -184,11 +184,43 @@ async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_
         except Exception:
             pass
 
+# ================== ХЕЛПЕРЫ ДЛЯ ТЕКСТА И ХЕШТЕГОВ ==================
+def extract_hashtags(msg: types.Message) -> list[str]:
+    """Извлекаем хештеги именно из entities, регистр игнорируем."""
+    tags = []
+    if not msg.entities:
+        return tags
+    text = msg.text or ""
+    for e in msg.entities:
+        if e.type == MessageEntityType.HASHTAG:
+            tag = text[e.offset:e.offset + e.length]
+            tags.append(tag.lower())
+    return tags
+
+def is_valid_chat(message: types.Message) -> bool:
+    return message.chat.type in ("private", "group", "supergroup")
+
+def is_valid_user(user: types.User | None) -> bool:
+    # отбрасываем анонимов/ботов/системного 777000
+    if not user:
+        return False
+    if user.is_bot:
+        return False
+    if int(user.id) == 777000:
+        return False
+    return True
+
 # ================== BOT (aiogram v2) ==================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
+
+@dp.message_handler(commands=["id"])
+async def cmd_id(message: types.Message):
+    uid = message.from_user.id if message.from_user else None
+    sent = await message.answer(f"Ваш user_id: {uid}")
+    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
 @dp.message_handler(commands=["ping"])
 async def cmd_ping(message: types.Message):
@@ -204,7 +236,7 @@ async def cmd_debug(message: types.Message):
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
-    sent = await message.answer("👋 Привет! Хештеги: #яздесь, #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня")
+    sent = await message.answer("👋 Привет! Хештеги: #яздесь, #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня, /id")
     asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id))
 
 @dp.message_handler(commands=["баланс", "balance", "итого"])
@@ -241,26 +273,40 @@ async def cmd_leaders_today(message: types.Message):
 
 @dp.message_handler(lambda m: isinstance(m.text, str) and m.text != "")
 async def handle_text(message: types.Message):
-    text = message.text.lower()
-    logger.info(f"[in] chat={message.chat.id} from={message.from_user.id} text={text!r}")
-    if any(tag in text for tag in VALID_TAGS):
-        try:
-            if await already_checked_today(message.from_user.id):
-                sent = await message.answer("⚠️ Сегодня вы уже отмечались, баллы не начислены.")
-                asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
-                return
-            await add_points(message.from_user, POINTS_PER_TAG)
-            total = await get_user_points(message.from_user.id)
-            sent1 = await message.answer("✅ Баллы начислены!")
-            sent2 = await message.answer(f"Ваш баланс: {total} баллов")
-            asyncio.create_task(auto_delete(bot, message.chat.id, sent1.message_id))
-            asyncio.create_task(auto_delete(bot, message.chat.id, sent2.message_id))
-            logger.info(f"[ok] points added uid={message.from_user.id} total={total}")
-        except Exception:
-            logger.exception("handle_text failed")
-            sent = await message.answer("⏳ Сервис временно недоступен. Попробуйте ещё раз.")
+    try:
+        # фильтры на тип чата и валидного пользователя
+        if not is_valid_chat(message):
+            logger.info(f"[skip] chat_type={message.chat.type}")
+            return
+        if not is_valid_user(message.from_user):
+            logger.info(f"[skip] invalid user: {message.from_user}")
+            return
+
+        tags = extract_hashtags(message)
+        logger.info(f"[in] chat={message.chat.id} uid={message.from_user.id} tags={tags}")
+        if not tags:
+            return
+
+        if not any(tag in VALID_TAGS for tag in tags):
+            return
+
+        if await already_checked_today(message.from_user.id):
+            sent = await message.answer("⚠️ Сегодня вы уже отмечались, баллы не начислены.")
             asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
-    # иначе — тихо игнорим
+            return
+
+        await add_points(message.from_user, POINTS_PER_TAG)
+        total = await get_user_points(message.from_user.id)
+        sent1 = await message.answer("✅ Баллы начислены!")
+        sent2 = await message.answer(f"Ваш баланс: {total} баллов")
+        asyncio.create_task(auto_delete(bot, message.chat.id, sent1.message_id))
+        asyncio.create_task(auto_delete(bot, message.chat.id, sent2.message_id))
+        logger.info(f"[ok] points added uid={message.from_user.id} total={total}")
+
+    except Exception:
+        logger.exception("handle_text failed")
+        sent = await message.answer("⏳ Сервис временно недоступен. Попробуйте ещё раз.")
+        asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id))
 
 # ================== WEBHOOK / AIOHTTP ==================
 def _path_from_webhook_url(default_path="/webhook"):

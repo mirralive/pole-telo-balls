@@ -46,27 +46,34 @@ logger = logging.getLogger("points-bot")
 bot = Bot(token=API_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
-
-# === GOOGLE SHEETS через ENV JSON ===
+# === GOOGLE SHEETS через ENV JSON/BASE64 ===
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not svc_json_env:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+svc_b64_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_BASE64")
 
-try:
-    service_account_info = json.loads(svc_json_env)
-except json.JSONDecodeError as e:
-    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON") from e
+service_account_info = None
+if svc_json_env:
+    try:
+        service_account_info = json.loads(svc_json_env)
+    except json.JSONDecodeError:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON содержит некорректный JSON")
+elif svc_b64_env:
+    import base64
+    try:
+        decoded = base64.b64decode(svc_b64_env).decode("utf-8")
+        service_account_info = json.loads(decoded)
+    except Exception as e:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_BASE64 некорректен") from e
+else:
+    raise RuntimeError("Нужно задать GOOGLE_SERVICE_ACCOUNT_JSON (или GOOGLE_SERVICE_ACCOUNT_BASE64)")
 
+from google.oauth2.service_account import Credentials
 creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
-sheet = gc.open(SHEET_NAME).sheet1  # первая вкладка
-
-# Создать заголовки, если лист пустой
+sheet = gc.open(SHEET_NAME).sheet1
 if not sheet.row_values(1):
     sheet.append_row(["UserID", "Username", "Points", "LastDate"])
-
 
 # === УТИЛИТЫ РАБОТЫ С ТАБЛИЦЕЙ ===
 def _today_utc_str() -> str:

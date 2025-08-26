@@ -22,7 +22,10 @@ bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
 # --- Конфигурация Google Sheets ---
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 if not svc_json_env:

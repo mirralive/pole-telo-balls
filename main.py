@@ -24,9 +24,9 @@ SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "challenge-points")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Amsterdam")
 
 # URL хоста (Render подставляет RENDER_EXTERNAL_URL)
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://example.com")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+# --- Webhook config ---
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ЯВНО задаём полную ссылку, если хотим
+WEBHOOK_PATH = "/webhook"               # роут остаётся
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
@@ -145,14 +145,25 @@ async def handle_text(message: types.Message):
     # иначе — молчим, бот реагирует только на хештеги и команды
 
 # ---------- Webhook ----------
+
 async def on_startup(app):
-    await bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(WEBHOOK_URL)
+            logger.info(f"Webhook установлен: {WEBHOOK_URL}")
+        except Exception:
+            logger.exception("Не удалось установить webhook — продолжаем без него")
+    else:
+        logger.warning("WEBHOOK_URL не задан — запускаемся без установки вебхука")
 
 async def on_shutdown(app):
-    await bot.delete_webhook()
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        logger.exception("Не удалось удалить webhook")
     await bot.session.close()
     logger.info("👋 Shutdown complete")
+
 
 async def handle_webhook(request):
     try:

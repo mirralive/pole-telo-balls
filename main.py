@@ -35,7 +35,10 @@ POINTS_PER_TAG = int(os.getenv("POINTS_PER_TAG", "5"))
 VALID_TAGS = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#яздесь,#челлендж1").split(",")}
 
 # ---------- Google Sheets ----------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 svc_json_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if not svc_json_env:
     raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")

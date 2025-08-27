@@ -13,15 +13,17 @@ from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, types
 from aiogram.types.message_entity import MessageEntityType
 
-# ============== ЛОГИ ==============
+# ================== ЛОГИ ==================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
-# ============== КОНФИГ ==============
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ================== КОНФИГ ==================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+MODE = os.getenv("MODE", "webhook").lower().strip()  # webhook | polling
 
 SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 SHEET_NAME     = os.getenv("GOOGLE_SHEET_NAME", "challenge-points")
@@ -30,13 +32,15 @@ LOCAL_TZ       = os.getenv("LOCAL_TZ", "Europe/Amsterdam")
 POINTS_PER_TAG = int(os.getenv("POINTS_PER_TAG", "5"))
 VALID_TAGS     = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#яздесь,#челлендж1").split(",")}
 
-WEBHOOK_URL    = os.getenv("WEBHOOK_URL")  # Полный URL вебхука (желательно с путём не "/")
+WEBHOOK_URL    = os.getenv("WEBHOOK_URL")  # рекомендуемый вид: https://<host>/tg
 WEBAPP_HOST    = "0.0.0.0"
 WEBAPP_PORT    = int(os.getenv("PORT", 10000))
 
 AUTODELETE_SECONDS = int(os.getenv("AUTODELETE_SECONDS", "5"))
+AUTOFIX_WEBHOOK    = os.getenv("AUTOFIX_WEBHOOK", "1") == "1"
+WEBHOOK_CHECK_SEC  = int(os.getenv("WEBHOOK_CHECK_SEC", "60"))
 
-# ============== GOOGLE SHEETS ==============
+# ================== GOOGLE SHEETS ==================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -75,7 +79,6 @@ def ensure_headers_sync():
             logger.info("Обновили строку заголовков")
     except Exception:
         logger.exception("Не удалось проверить/обновить заголовки")
-
 ensure_headers_sync()
 
 # ====== Sheets в отдельном потоке ======
@@ -103,11 +106,7 @@ async def read_records():
 
 async def get_user_points(user_id: int) -> int:
     records = await read_records()
-    total = sum(
-        _safe_int(r.get("Points"))
-        for r in records
-        if str(r.get("User_id")) == str(user_id)
-    )
+    total = sum(_safe_int(r.get("Points")) for r in records if str(r.get("User_id")) == str(user_id))
     logger.info(f"[logic] get_user_points uid={user_id} -> {total}")
     return total
 
@@ -171,10 +170,11 @@ async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_
     if delay <= 0:
         return
     await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, bot_message_id)
-    except Exception:
-        pass
+    for mid in (bot_message_id,):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
     if user_message_id:
         try:
             await bot.delete_message(chat_id, user_message_id)
@@ -208,9 +208,10 @@ Bot.set_current(bot)
 Dispatcher.set_current(dp)
 
 async def send_and_autodelete(message: types.Message, text: str, delete_user: bool = False):
-    logger.info(f"[send] -> chat={message.chat.id}, text={text[:60]!r}...")
     sent = await message.answer(text)
-    asyncio.create_task(auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id if delete_user else None))
+    asyncio.create_task(
+        auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id if delete_user else None)
+    )
     return sent
 
 @dp.message_handler(commands=["id"])
@@ -225,7 +226,7 @@ async def cmd_ping(message: types.Message):
 @dp.message_handler(commands=["debug"])
 async def cmd_debug(message: types.Message):
     path = (urlparse(WEBHOOK_URL).path or "/tg") if WEBHOOK_URL else "/tg"
-    await send_and_autodelete(message, f"✅ Бот жив.\nWEBHOOK_PATH: {path}\nTZ: {LOCAL_TZ}", delete_user=True)
+    await send_and_autodelete(message, f"✅ Бот жив.\nMODE: {MODE}\nWEBHOOK_PATH: {path}\nTZ: {LOCAL_TZ}", delete_user=True)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
@@ -267,33 +268,23 @@ async def cmd_leaders_today(message: types.Message):
 @dp.message_handler(lambda m: isinstance(m.text, str) and m.text != "")
 async def handle_text(message: types.Message):
     try:
-        if not is_valid_chat(message):
-            logger.info(f"[skip] chat_type={message.chat.type}")
+        if not is_valid_chat(message) or not is_valid_user(message.from_user):
             return
-        if not is_valid_user(message.from_user):
-            logger.info(f"[skip] invalid user: {message.from_user}")
-            return
-
         tags = extract_hashtags(message)
-        logger.info(f"[in] chat={message.chat.id} uid={message.from_user.id} tags={tags}")
         if not tags or not any(tag in VALID_TAGS for tag in tags):
             return
-
         if await already_checked_today(message.from_user.id):
             await send_and_autodelete(message, "⚠️ Сегодня вы уже отмечались, баллы не начислены.")
             return
-
         await add_points(message.from_user, POINTS_PER_TAG)
         total = await get_user_points(message.from_user.id)
         await send_and_autodelete(message, "✅ Баллы начислены!")
         await send_and_autodelete(message, f"Ваш баланс: {total} баллов")
-        logger.info(f"[ok] points added uid={message.from_user.id} total={total}")
-
     except Exception:
         logger.exception("handle_text failed")
         await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.")
 
-# ============== WEBHOOK / AIOHTTP ==============
+# ============== WEBHOOK / POLLING / AIOHTTP ==============
 def _path_from_webhook_url(default_path="/tg"):
     if WEBHOOK_URL:
         try:
@@ -305,21 +296,50 @@ def _path_from_webhook_url(default_path="/tg"):
 
 WEBHOOK_PATH = _path_from_webhook_url("/tg")
 
-async def on_startup(app):
-    if WEBHOOK_URL:
+async def webhook_watchdog():
+    """Периодически проверяет и чинит вебхук (если включён AUTOFIX_WEBHOOK)."""
+    if MODE != "webhook" or not AUTOFIX_WEBHOOK:
+        return
+    while True:
         try:
-            await bot.set_webhook(WEBHOOK_URL)
-            logger.info(f"Webhook установлен: {WEBHOOK_URL}")
+            info = await bot.get_webhook_info()
+            need_fix = (not info.url) or (WEBHOOK_URL and info.url != WEBHOOK_URL)
+            if need_fix:
+                logger.warning(f"[watchdog] webhook mismatch: have='{info.url}', want='{WEBHOOK_URL}'. Fixing…")
+                await bot.set_webhook(WEBHOOK_URL)
+                info = await bot.get_webhook_info()
+                logger.info(f"[watchdog] webhook set: url={info.url} pending={info.pending_update_count} last_error={info.last_error_message}")
         except Exception:
-            logger.exception("Не удалось установить webhook — продолжаем без него")
+            logger.exception("[watchdog] get/set webhook failed")
+        await asyncio.sleep(WEBHOOK_CHECK_SEC)
+
+async def on_startup(app):
+    if MODE == "webhook":
+        if WEBHOOK_URL:
+            try:
+                await bot.set_webhook(WEBHOOK_URL)
+                info = await bot.get_webhook_info()
+                logger.info(f"Webhook установлен: {WEBHOOK_URL} | info: url={info.url}, pending={info.pending_update_count}, last_error={info.last_error_message}")
+            except Exception:
+                logger.exception("Не удалось установить webhook — продолжаем без него")
+        else:
+            logger.warning("WEBHOOK_URL не задан — Telegram не знает, куда слать апдейты.")
+        # запустим watchdog
+        asyncio.create_task(webhook_watchdog())
     else:
-        logger.warning("WEBHOOK_URL не задан — сервер поднят, но Telegram не знает, куда слать апдейты.")
+        # POLLING режим — удаляем вебхук и запускаем polling
+        try:
+            await bot.delete_webhook()
+        except Exception:
+            pass
+        logger.info("Starting LONG POLLING…")
+        asyncio.create_task(dp.start_polling())
 
 async def on_shutdown(app):
     try:
         await bot.delete_webhook()
     except Exception:
-        logger.exception("Не удалось удалить webhook")
+        pass
     try:
         session = await bot.get_session()
         await session.close()
@@ -328,13 +348,12 @@ async def on_shutdown(app):
     logger.info("👋 Shutdown complete")
 
 async def handle_webhook(request):
+    if MODE != "webhook":
+        return web.Response(status=200, text="Polling mode")
     try:
         data = await request.json()
-        upd_keys = ", ".join(data.keys())
-        logger.info(f"[update] keys: {upd_keys}")
         update = types.Update(**data)
-        Bot.set_current(bot)
-        Dispatcher.set_current(dp)
+        Bot.set_current(bot); Dispatcher.set_current(dp)
         await dp.process_update(update)
         return web.Response(status=200)
     except Exception:
@@ -342,29 +361,49 @@ async def handle_webhook(request):
         return web.Response(status=200)
 
 async def healthcheck(request):
-    return web.Response(text="ok")
+    return web.Response(text=f"ok {datetime.utcnow().isoformat()}Z MODE={MODE}")
 
 async def set_webhook(request):
+    if MODE != "webhook":
+        return web.Response(text="MODE != webhook", status=400)
     if not WEBHOOK_URL:
         return web.Response(text="WEBHOOK_URL env is empty", status=400)
     try:
         await bot.set_webhook(WEBHOOK_URL)
-        return web.Response(text=f"Webhook set: ok\n{WEBHOOK_URL}")
+        info = await bot.get_webhook_info()
+        return web.Response(text=f"Webhook set: ok\nurl={info.url}\npending={info.pending_update_count}\nlast_error={info.last_error_message}")
     except Exception as e:
         logger.exception("set_webhook failed")
         return web.Response(text=f"Webhook set: failed\n{e}", status=500)
 
+async def delete_webhook(request):
+    try:
+        await bot.delete_webhook()
+        return web.Response(text="Webhook deleted: ok")
+    except Exception as e:
+        logger.exception("delete_webhook failed")
+        return web.Response(text=f"Webhook delete: failed\n{e}", status=500)
+
+async def webhook_info(request):
+    try:
+        info = await bot.get_webhook_info()
+        return web.Response(
+            text=f"url={info.url}\npending={info.pending_update_count}\nip={info.ip_address}\nlast_error_date={info.last_error_date}\nlast_error={info.last_error_message}"
+        )
+    except Exception as e:
+        logger.exception("webhook_info failed")
+        return web.Response(text=f"getWebhookInfo failed\n{e}", status=500)
+
 app = web.Application()
 app.router.add_get("/", healthcheck)
+# Приём апдейтов: целевой путь и корень — чтобы не промазать
 app.router.add_post(WEBHOOK_PATH, handle_webhook)
-# зеркальный маршрут с/без слеша
-if WEBHOOK_PATH.endswith("/"):
-    app.router.add_post(WEBHOOK_PATH.rstrip("/"), handle_webhook)
-else:
-    app.router.add_post(WEBHOOK_PATH + "/", handle_webhook)
-# ручной ребайнд вебхука
-app.router.add_get("/set-webhook", set_webhook)
 app.router.add_post("/", handle_webhook)
+# Сервисные:
+app.router.add_get("/set-webhook", set_webhook)
+app.router.add_get("/delete-webhook", delete_webhook)
+app.router.add_get("/webhook-info", webhook_info)
+
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 

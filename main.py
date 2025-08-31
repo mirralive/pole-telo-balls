@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("points-bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
-# ============== КОНФИГ (polling-only) ==============
+# ============== КОНФИГ (POLLING ONLY) ==============
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -33,7 +33,7 @@ VALID_TAGS     = {t.strip().lower() for t in os.getenv("VALID_TAGS", "#язде�
 WEBAPP_HOST    = "0.0.0.0"
 WEBAPP_PORT    = int(os.getenv("PORT", 10000))
 
-# Раздельные настройки автоудаления
+# Раздельные автоудаления
 AUTODELETE_SECONDS_PRIVATE      = int(os.getenv("AUTODELETE_SECONDS_PRIVATE", "5"))
 AUTODELETE_SECONDS_GROUP_REPLY  = int(os.getenv("AUTODELETE_SECONDS_GROUP_REPLY", "20"))
 DELETE_USER_COMMAND_IN_GROUPS   = os.getenv("DELETE_USER_COMMAND_IN_GROUPS", "1") == "1"
@@ -79,13 +79,12 @@ def ensure_headers_sync():
         logger.exception("Не удалось проверить/обновить заголовки")
 ensure_headers_sync()
 
-# ====== Sheets в отдельном потоке ======
+# ====== Sheets helpers ======
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 def _today_str() -> str:
-    tz = ZoneInfo(LOCAL_TZ)
-    return datetime.now(tz).date().isoformat()
+    return datetime.now(ZoneInfo(LOCAL_TZ)).date().isoformat()
 
 def _safe_int(x) -> int:
     try:
@@ -98,22 +97,18 @@ def _read_records_sync():
 
 async def read_records():
     t0 = time.time()
-    records = await _to_thread(_read_records_sync)
-    logger.info(f"[sheets] read_records: {len(records)} rows in {time.time()-t0:.3f}s")
-    return records
+    rows = await _to_thread(_read_records_sync)
+    logger.info(f"[sheets] read_records: {len(rows)} rows in {time.time()-t0:.3f}s")
+    return rows
 
-async def get_user_points(user_id: int) -> int:
-    records = await read_records()
-    total = sum(_safe_int(r.get("Points")) for r in records if str(r.get("User_id")) == str(user_id))
-    logger.info(f"[logic] get_user_points uid={user_id} -> {total}")
-    return total
+async def get_user_points(uid: int) -> int:
+    recs = await read_records()
+    return sum(_safe_int(r.get("Points")) for r in recs if str(r.get("User_id")) == str(uid))
 
-async def already_checked_today(user_id: int) -> bool:
-    records = await read_records()
-    today = _today_str()
-    res = any(str(r.get("User_id")) == str(user_id) and str(r.get("Date")) == today for r in records)
-    logger.info(f"[logic] already_checked_today uid={user_id} -> {res}")
-    return res
+async def already_checked_today(uid: int) -> bool:
+    recs = await read_records()
+    t = _today_str()
+    return any(str(r.get("User_id")) == str(uid) and str(r.get("Date")) == t for r in recs)
 
 def _append_row_sync(row):
     sheet.append_row(row)
@@ -126,26 +121,22 @@ async def add_points(user: types.User, points: int):
         int(points),
         _today_str(),
     ]
-    t0 = time.time()
     await _to_thread(_append_row_sync, row)
-    logger.info(f"[sheets] append_row for uid={user.id} in {time.time()-t0:.3f}s")
 
-async def get_leaderboard(top_n: int = 10, today_only: bool = False):
-    records = await read_records()
+async def get_leaderboard(top_n=10, today_only=False):
+    recs = await read_records()
     totals, names, usernames = {}, {}, {}
-    today = _today_str()
-    for r in records:
-        if today_only and str(r.get("Date")) != today:
+    t = _today_str()
+    for r in recs:
+        if today_only and str(r.get("Date")) != t:
             continue
         uid = str(r.get("User_id"))
         pts = _safe_int(r.get("Points"))
         totals[uid] = totals.get(uid, 0) + pts
-        nm = str(r.get("Name") or "").strip()
-        un = str(r.get("Username") or "").strip()
-        if nm:
-            names[uid] = nm
-        if un:
-            usernames[uid] = un
+        nm = (r.get("Name") or "").strip()
+        un = (r.get("Username") or "").strip()
+        if nm: names[uid] = nm
+        if un: usernames[uid] = un
     items = []
     for uid, total in totals.items():
         name = names.get(uid) or (("@" + usernames[uid]) if usernames.get(uid) else uid)
@@ -153,50 +144,59 @@ async def get_leaderboard(top_n: int = 10, today_only: bool = False):
     items.sort(key=lambda x: (-x[0], x[1].lower()))
     return items[:top_n]
 
-def format_leaderboard(items, title="🏆 Топ-10"):
+def format_leaderboard(items, title):
     if not items:
         return f"{title}\nПока нет данных."
     lines = [title]
-    for idx, (total, name, username, uid) in enumerate(items, start=1):
+    for i, (total, name, username, uid) in enumerate(items, 1):
         handle = f" (@{username})" if username else ""
-        lines.append(f"{idx}. {name}{handle} — {total}")
+        lines.append(f"{i}. {name}{handle} — {total}")
     return "\n".join(lines)
 
-# ====== авто-удаление и отправка в нужный тред ======
+# ====== авто-удаление и отправка в тот же тред ======
 def _is_group(chat: types.Chat) -> bool:
     return chat.type in ("group", "supergroup")
 
-async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_id: int | None, delay: int, delete_user: bool):
+async def auto_delete(bot: Bot, chat_id: int, bot_mid: int, user_mid: int | None, delay: int, delete_user: bool):
     if delay <= 0:
         return
     await asyncio.sleep(delay)
     try:
-        await bot.delete_message(chat_id, bot_message_id)
+        await bot.delete_message(chat_id, bot_mid)
     except Exception:
         pass
-    if delete_user and user_message_id:
+    if delete_user and user_mid:
         try:
-            await bot.delete_message(chat_id, user_message_id)
+            await bot.delete_message(chat_id, user_mid)
         except Exception:
             pass
 
-async def send_and_autodelete(message: types.Message, text: str, is_command: bool = False):
+async def send_autodel(message: types.Message, text: str, is_command: bool = False):
     """
-    Отправляем ответ в тот же комментарный тред (message_thread_id), если он есть.
-    Раздельные тайминги автоудаления для лички и групп/комментариев.
+    Пытаемся отправить ответ в тот же комментарный тред (message_thread_id),
+    если тред недоступен — шлём без thread_id в общий чат.
+    Разные тайминги автоудаления для лички и групп.
     """
     thread_id = getattr(message, "message_thread_id", None)
-    sent = await bot.send_message(
-        chat_id=message.chat.id,
-        text=text,
-        message_thread_id=thread_id  # критично для комментариев к постам/форум-тем
-    )
+    try:
+        sent = await bot.send_message(
+            chat_id=message.chat.id,
+            text=text,
+            message_thread_id=thread_id if thread_id else None
+        )
+    except aioexc.BadRequest as e:
+        if "Message thread not found" in str(e):
+            sent = await bot.send_message(chat_id=message.chat.id, text=text)
+        else:
+            raise
+
     if _is_group(message.chat):
         delay = AUTODELETE_SECONDS_GROUP_REPLY
         delete_user = DELETE_USER_COMMAND_IN_GROUPS and is_command
     else:
         delay = AUTODELETE_SECONDS_PRIVATE
-        delete_user = False  # в личке нельзя удалять сообщения пользователя
+        delete_user = False  # в личке Телеграм не даёт удалять сообщения пользователя
+
     asyncio.create_task(
         auto_delete(
             bot,
@@ -209,7 +209,7 @@ async def send_and_autodelete(message: types.Message, text: str, is_command: boo
     )
     return sent
 
-# ============== ХЭЛПЕРЫ: чат/юзер/хештеги ==============
+# ====== ХЭЛПЕРЫ: чат/юзер/хештеги ======
 def extract_hashtags(msg: types.Message) -> list[str]:
     tags = []
     if not msg or not msg.entities:
@@ -217,109 +217,97 @@ def extract_hashtags(msg: types.Message) -> list[str]:
     text = msg.text or ""
     for e in msg.entities:
         if e.type == MessageEntityType.HASHTAG:
-            tag = text[e.offset:e.offset + e.length]
-            tags.append(tag.lower())
+            tags.append(text[e.offset:e.offset+e.length].lower())
     return tags
 
 def is_valid_chat(message: types.Message) -> bool:
     return message.chat.type in ("private", "group", "supergroup")
 
 def is_valid_user(user: types.User | None) -> bool:
-    if not user or user.is_bot or int(user.id) == 777000:
-        return False
-    return True
+    return bool(user) and not user.is_bot and int(user.id) != 777000
 
-# ============== BOT (aiogram v2) ==============
+# ====== BOT ======
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-Bot.set_current(bot)
-Dispatcher.set_current(dp)
-
-@dp.message_handler(commands=["id"])
-async def cmd_id(message: types.Message):
-    uid = message.from_user.id if message.from_user else None
-    await send_and_autodelete(message, f"Ваш user_id: {uid}", is_command=True)
-
-@dp.message_handler(commands=["ping"])
-async def cmd_ping(message: types.Message):
-    await send_and_autodelete(message, "pong", is_command=True)
+Bot.set_current(bot); Dispatcher.set_current(dp)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
-    await send_and_autodelete(
-        message,
-        "👋 Привет! Хештеги: #яздесь, #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня, /id",
-        is_command=True
-    )
+    await send_autodel(message, "👋 Привет! Хештеги: #яздесь, #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня, /id", True)
 
-@dp.message_handler(commands=["debug"])
-async def cmd_debug(message: types.Message):
-    await send_and_autodelete(
-        message,
-        "✅ Бот жив (polling-only). TZ: {tz}".format(tz=LOCAL_TZ),
-        is_command=True
-    )
+@dp.message_handler(commands=["id"])
+async def cmd_id(message: types.Message):
+    await send_autodel(message, f"Ваш user_id: {message.from_user.id if message.from_user else None}", True)
+
+@dp.message_handler(commands=["ping"])
+async def cmd_ping(message: types.Message):
+    await send_autodel(message, "pong", True)
 
 @dp.message_handler(commands=["баланс", "balance", "итого"])
 async def cmd_balance(message: types.Message):
     try:
         total = await get_user_points(message.from_user.id)
-        await send_and_autodelete(message, f"Ваш баланс: {total} баллов", is_command=True)
+        await send_autodel(message, f"Ваш баланс: {total} баллов", True)
     except Exception:
         logger.exception("cmd_balance failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
+        await send_autodel(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", True)
 
 @dp.message_handler(commands=["итоги", "leaders", "топ", "top"])
 async def cmd_leaders(message: types.Message):
     try:
-        items = await get_leaderboard(top_n=10, today_only=False)
-        text = format_leaderboard(items, title="🏆 Итоги (всего), топ-10")
-        await send_and_autodelete(message, text, is_command=True)
+        items = await get_leaderboard(10, today_only=False)
+        await send_autodel(message, format_leaderboard(items, "🏆 Итоги (всего), топ-10"), True)
     except Exception:
         logger.exception("cmd_leaders failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
+        await send_autodel(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", True)
 
 @dp.message_handler(commands=["итоги_сегодня", "leaders_today", "топ_сегодня", "top_today"])
 async def cmd_leaders_today(message: types.Message):
     try:
-        items = await get_leaderboard(top_n=10, today_only=True)
-        text = format_leaderboard(items, title=f"🌞 Итоги за {_today_str()}, топ-10")
-        await send_and_autodelete(message, text, is_command=True)
+        items = await get_leaderboard(10, today_only=True)
+        await send_autodel(message, format_leaderboard(items, f"🌞 Итоги за {_today_str()}, топ-10"), True)
     except Exception:
         logger.exception("cmd_leaders_today failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
+        await send_autodel(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", True)
 
 @dp.message_handler(lambda m: isinstance(m.text, str) and m.text != "")
 async def handle_text(message: types.Message):
+    if not is_valid_chat(message) or not is_valid_user(message.from_user):
+        return
+    tags = extract_hashtags(message)
+    if not tags or not any(t in VALID_TAGS for t in tags):
+        return
     try:
-        if not is_valid_chat(message) or not is_valid_user(message.from_user):
-            return
-        tags = extract_hashtags(message)
-        if not tags or not any(tag in VALID_TAGS for tag in tags):
-            return
         if await already_checked_today(message.from_user.id):
-            await send_and_autodelete(message, "⚠️ Сегодня вы уже отмечались, баллы не начислены.")
+            await send_autodel(message, "⚠️ Сегодня вы уже отмечались, баллы не начислены.")
             return
         await add_points(message.from_user, POINTS_PER_TAG)
         total = await get_user_points(message.from_user.id)
-        await send_and_autodelete(message, "✅ Баллы начислены!")
-        await send_and_autodelete(message, f"Ваш баланс: {total} баллов")
+        await send_autodel(message, "✅ Баллы начислены!")
+        await send_autodel(message, f"Ваш баланс: {total} баллов")
     except Exception:
         logger.exception("handle_text failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.")
+        await send_autodel(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.")
 
-# ============== POLLING RUNNER + HEALTH ==============
+# ====== HEALTH + DIAG ======
 async def healthcheck(request):
     return web.Response(text=f"ok {datetime.utcnow().isoformat()}Z MODE=polling")
 
+async def getme(request):
+    try:
+        me = await request.app["bot"].get_me()
+        return web.json_response({"ok": True, "id": me.id, "username": me.username})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+# ====== START/STOP (POLLING with RETRIES) ======
 async def on_startup(app):
-    # 1) На всякий случай снимаем вебхук (без дропа очереди)
+    # На всякий — снимаем вебхук (если где-то включили)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
 
-    # 2) Живучий цикл поллинга с ретраями
     async def polling_forever():
         while True:
             try:
@@ -327,7 +315,6 @@ async def on_startup(app):
                 await dp.start_polling()
             except (aioexc.TerminatedByOtherGetUpdates, aioexc.CantGetUpdates) as e:
                 logger.warning(f"[polling] другой getUpdates активен ({e}). Жду 10 сек и пробую снова…")
-                # На всякий случай ещё раз снимем вебхук (если где-то включили)
                 try:
                     await bot.delete_webhook(drop_pending_updates=False)
                 except Exception:
@@ -342,14 +329,6 @@ async def on_startup(app):
     asyncio.create_task(polling_forever())
     logger.info("Started LONG POLLING (webhook disabled).")
 
-async def getme(request):
-    try:
-        me = await request.app["bot"].get_me()
-        return web.json_response({"ok": True, "id": me.id, "username": me.username})
-    except Exception as e:
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
-
-
 async def on_shutdown(app):
     try:
         session = await bot.get_session()
@@ -359,7 +338,9 @@ async def on_shutdown(app):
     logger.info("👋 Shutdown complete")
 
 app = web.Application()
+app["bot"] = bot
 app.router.add_get("/", healthcheck)
+app.router.add_get("/diag/getme", getme)
 
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)

@@ -179,7 +179,6 @@ async def send_autodel(message: types.Message, text: str, is_command: bool = Fal
     """
     thread_id = getattr(message, "message_thread_id", None)
 
-    # формируем kwargs без пустых полей
     kwargs = {"chat_id": message.chat.id, "text": text}
     if thread_id:
         kwargs["message_thread_id"] = thread_id
@@ -304,12 +303,12 @@ async def getme(request):
 
 # ====== START/STOP (SINGLE POLLING) ======
 async def on_startup(app):
-    # На всякий — снимаем вебхук (если где-то включили)
+    # На всякий — снимаем вебхук (если кто-то где-то включил)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
-    # Запускаем ОДИН раз; без ретрая, чтобы не ловить "Polling already started"
+    # Запускаем поллинг ОДИН раз; без ретраев, чтобы не ловить "Polling already started"
     asyncio.create_task(dp.start_polling())
     logger.info("Started LONG POLLING (webhook disabled).")
 

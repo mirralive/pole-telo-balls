@@ -36,7 +36,11 @@ WEBHOOK_URL    = os.getenv("WEBHOOK_URL")  # рекомендуемый вид: 
 WEBAPP_HOST    = "0.0.0.0"
 WEBAPP_PORT    = int(os.getenv("PORT", 10000))
 
-AUTODELETE_SECONDS = int(os.getenv("AUTODELETE_SECONDS", "5"))
+# Раздельные настройки автоудаления
+AUTODELETE_SECONDS_PRIVATE      = int(os.getenv("AUTODELETE_SECONDS_PRIVATE", "5"))
+AUTODELETE_SECONDS_GROUP_REPLY  = int(os.getenv("AUTODELETE_SECONDS_GROUP_REPLY", "20"))
+DELETE_USER_COMMAND_IN_GROUPS   = os.getenv("DELETE_USER_COMMAND_IN_GROUPS", "1") == "1"
+
 AUTOFIX_WEBHOOK    = os.getenv("AUTOFIX_WEBHOOK", "1") == "1"
 WEBHOOK_CHECK_SEC  = int(os.getenv("WEBHOOK_CHECK_SEC", "60"))
 
@@ -164,22 +168,52 @@ def format_leaderboard(items, title="🏆 Топ-10"):
         lines.append(f"{idx}. {name}{handle} — {total}")
     return "\n".join(lines)
 
-# ====== авто-удаление ======
-async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_id: int | None = None):
-    delay = AUTODELETE_SECONDS
+# ====== авто-удаление и отправка в нужный тред ======
+def _is_group(chat: types.Chat) -> bool:
+    return chat.type in ("group", "supergroup")
+
+async def auto_delete(bot: Bot, chat_id: int, bot_message_id: int, user_message_id: int | None, delay: int, delete_user: bool):
     if delay <= 0:
         return
     await asyncio.sleep(delay)
-    for mid in (bot_message_id,):
-        try:
-            await bot.delete_message(chat_id, mid)
-        except Exception:
-            pass
-    if user_message_id:
+    try:
+        await bot.delete_message(chat_id, bot_message_id)
+    except Exception:
+        pass
+    if delete_user and user_message_id:
         try:
             await bot.delete_message(chat_id, user_message_id)
         except Exception:
             pass
+
+async def send_and_autodelete(message: types.Message, text: str, is_command: bool = False):
+    """
+    Отправляем ответ в тот же комментарный тред (message_thread_id), если он есть.
+    Плюс — раздельные тайминги автоудаления для лички и групп/комментариев.
+    """
+    thread_id = getattr(message, "message_thread_id", None)
+    sent = await bot.send_message(
+        chat_id=message.chat.id,
+        text=text,
+        message_thread_id=thread_id  # <-- ключ: отправка в тот же топик/комментарии
+    )
+    if _is_group(message.chat):
+        delay = AUTODELETE_SECONDS_GROUP_REPLY
+        delete_user = DELETE_USER_COMMAND_IN_GROUPS and is_command
+    else:
+        delay = AUTODELETE_SECONDS_PRIVATE
+        delete_user = False  # в личке Телеграм не позволяет удалять сообщения пользователя
+    asyncio.create_task(
+        auto_delete(
+            bot,
+            message.chat.id,
+            sent.message_id,
+            message.message_id if delete_user else None,
+            delay,
+            delete_user
+        )
+    )
+    return sent
 
 # ============== ХЭЛПЕРЫ: чат/юзер/хештеги ==============
 def extract_hashtags(msg: types.Message) -> list[str]:
@@ -207,63 +241,56 @@ dp = Dispatcher(bot)
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
 
-async def send_and_autodelete(message: types.Message, text: str, delete_user: bool = False):
-    sent = await message.answer(text)
-    asyncio.create_task(
-        auto_delete(bot, message.chat.id, sent.message_id, user_message_id=message.message_id if delete_user else None)
-    )
-    return sent
-
 @dp.message_handler(commands=["id"])
 async def cmd_id(message: types.Message):
     uid = message.from_user.id if message.from_user else None
-    await send_and_autodelete(message, f"Ваш user_id: {uid}", delete_user=True)
+    await send_and_autodelete(message, f"Ваш user_id: {uid}", is_command=True)
 
 @dp.message_handler(commands=["ping"])
 async def cmd_ping(message: types.Message):
-    await send_and_autodelete(message, "pong", delete_user=True)
+    await send_and_autodelete(message, "pong", is_command=True)
 
 @dp.message_handler(commands=["debug"])
 async def cmd_debug(message: types.Message):
     path = (urlparse(WEBHOOK_URL).path or "/tg") if WEBHOOK_URL else "/tg"
-    await send_and_autodelete(message, f"✅ Бот жив.\nMODE: {MODE}\nWEBHOOK_PATH: {path}\nTZ: {LOCAL_TZ}", delete_user=True)
+    await send_and_autodelete(message, f"✅ Бот жив.\nMODE: {MODE}\nWEBHOOK_PATH: {path}\nTZ: {LOCAL_TZ}", is_command=True)
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
     await send_and_autodelete(
         message,
         "👋 Привет! Хештеги: #яздесь, #челлендж1.\nКоманды: /баланс, /итоги, /итоги_сегодня, /id",
-        delete_user=True
+        is_command=True
     )
 
 @dp.message_handler(commands=["баланс", "balance", "итого"])
 async def cmd_balance(message: types.Message):
     try:
         total = await get_user_points(message.from_user.id)
-        await send_and_autodelete(message, f"Ваш баланс: {total} баллов", delete_user=True)
+        await send_and_autodelete(message, f"Ваш баланс: {total} баллов", is_command=True)
     except Exception:
         logger.exception("cmd_balance failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", delete_user=True)
+        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
 
 @dp.message_handler(commands=["итоги", "leaders", "топ", "top"])
 async def cmd_leaders(message: types.Message):
     try:
         items = await get_leaderboard(top_n=10, today_only=False)
         text = format_leaderboard(items, title="🏆 Итоги (всего), топ-10")
-        await send_and_autodelete(message, text, delete_user=True)
+        await send_and_autodelete(message, text, is_command=True)
     except Exception:
         logger.exception("cmd_leaders failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", delete_user=True)
+        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
 
 @dp.message_handler(commands=["итоги_сегодня", "leaders_today", "топ_сегодня", "top_today"])
 async def cmd_leaders_today(message: types.Message):
     try:
         items = await get_leaderboard(top_n=10, today_only=True)
         text = format_leaderboard(items, title=f"🌞 Итоги за {_today_str()}, топ-10")
-        await send_and_autodelete(message, text, delete_user=True)
+        await send_and_autodelete(message, text, is_command=True)
     except Exception:
         logger.exception("cmd_leaders_today failed")
-        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", delete_user=True)
+        await send_and_autodelete(message, "⏳ Сервис временно недоступен. Попробуйте ещё раз.", is_command=True)
 
 @dp.message_handler(lambda m: isinstance(m.text, str) and m.text != "")
 async def handle_text(message: types.Message):

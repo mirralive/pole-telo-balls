@@ -342,6 +342,14 @@ async def on_startup(app):
     asyncio.create_task(polling_forever())
     logger.info("Started LONG POLLING (webhook disabled).")
 
+async def getme(request):
+    try:
+        me = await request.app["bot"].get_me()
+        return web.json_response({"ok": True, "id": me.id, "username": me.username})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
 async def on_shutdown(app):
     try:
         session = await bot.get_session()

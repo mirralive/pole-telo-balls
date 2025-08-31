@@ -173,17 +173,19 @@ async def auto_delete(bot: Bot, chat_id: int, bot_mid: int, user_mid: int | None
 
 async def send_autodel(message: types.Message, text: str, is_command: bool = False):
     """
-    Пытаемся отправить ответ в тот же комментарный тред (message_thread_id),
-    если тред недоступен — шлём без thread_id в общий чат.
+    Отправляем ответ в тот же комментарный тред (message_thread_id) — только если он есть.
+    При ошибке 'Message thread not found' шлём без thread_id в общий чат.
     Разные тайминги автоудаления для лички и групп.
     """
     thread_id = getattr(message, "message_thread_id", None)
+
+    # формируем kwargs без пустых полей
+    kwargs = {"chat_id": message.chat.id, "text": text}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+
     try:
-        sent = await bot.send_message(
-            chat_id=message.chat.id,
-            text=text,
-            message_thread_id=thread_id if thread_id else None
-        )
+        sent = await bot.send_message(**kwargs)
     except aioexc.BadRequest as e:
         if "Message thread not found" in str(e):
             sent = await bot.send_message(chat_id=message.chat.id, text=text)
@@ -195,7 +197,7 @@ async def send_autodel(message: types.Message, text: str, is_command: bool = Fal
         delete_user = DELETE_USER_COMMAND_IN_GROUPS and is_command
     else:
         delay = AUTODELETE_SECONDS_PRIVATE
-        delete_user = False  # в личке Телеграм не даёт удалять сообщения пользователя
+        delete_user = False  # в личке нельзя удалять сообщения пользователя
 
     asyncio.create_task(
         auto_delete(
@@ -300,33 +302,15 @@ async def getme(request):
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-# ====== START/STOP (POLLING with RETRIES) ======
+# ====== START/STOP (SINGLE POLLING) ======
 async def on_startup(app):
     # На всякий — снимаем вебхук (если где-то включили)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
-
-    async def polling_forever():
-        while True:
-            try:
-                logging.getLogger("aiogram.dispatcher.dispatcher").info("Start polling loop…")
-                await dp.start_polling()
-            except (aioexc.TerminatedByOtherGetUpdates, aioexc.CantGetUpdates) as e:
-                logger.warning(f"[polling] другой getUpdates активен ({e}). Жду 10 сек и пробую снова…")
-                try:
-                    await bot.delete_webhook(drop_pending_updates=False)
-                except Exception:
-                    pass
-                await asyncio.sleep(10)
-                continue
-            except Exception:
-                logger.exception("[polling] упал из-за ошибки. Ретрай через 10 сек…")
-                await asyncio.sleep(10)
-                continue
-
-    asyncio.create_task(polling_forever())
+    # Запускаем ОДИН раз; без ретрая, чтобы не ловить "Polling already started"
+    asyncio.create_task(dp.start_polling())
     logger.info("Started LONG POLLING (webhook disabled).")
 
 async def on_shutdown(app):

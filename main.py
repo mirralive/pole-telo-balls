@@ -123,7 +123,7 @@ async def add_points(user: types.User, points: int):
     ]
     await _to_thread(_append_row_sync, row)
 
-async def get_leaderboard(top_n=10, today_only=False):
+async def get_leaderboard(top_n=15, today_only=False):
     recs = await read_records()
     totals, names, usernames = {}, {}, {}
     t = _today_str()
@@ -256,7 +256,7 @@ async def cmd_balance(message: types.Message):
 @dp.message_handler(commands=["итоги", "leaders", "топ", "top"])
 async def cmd_leaders(message: types.Message):
     try:
-        items = await get_leaderboard(10, today_only=False)
+        items = await get_leaderboard(15, today_only=False)
         await send_autodel(message, format_leaderboard(items, "🏆 Итоги (всего), топ-10"), True)
     except Exception:
         logger.exception("cmd_leaders failed")
@@ -265,7 +265,7 @@ async def cmd_leaders(message: types.Message):
 @dp.message_handler(commands=["итоги_сегодня", "leaders_today", "топ_сегодня", "top_today"])
 async def cmd_leaders_today(message: types.Message):
     try:
-        items = await get_leaderboard(10, today_only=True)
+        items = await get_leaderboard(15, today_only=True)
         await send_autodel(message, format_leaderboard(items, f"🌞 Итоги за {_today_str()}, топ-10"), True)
     except Exception:
         logger.exception("cmd_leaders_today failed")
